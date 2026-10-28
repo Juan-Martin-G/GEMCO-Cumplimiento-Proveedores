@@ -1,0 +1,18 @@
+# Datos: NUNCA se suben al repo (el repo es público)
+*.xlsx
+*.xlsm
+*.xlsb
+*.xls
+*.csv
+*.ods
+data/
+Old/
+~$*
+
+# Sistema / editores
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.claude/
+node_modules/
