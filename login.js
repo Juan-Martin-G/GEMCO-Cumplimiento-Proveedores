@@ -11,6 +11,8 @@ const ACCESO = {
     serviceId: 'service_l9u0laa',
     templateId: 'template_buuarj5', // variables: {{to_email}} y {{codigo}}
   },
+  nombrePanel: 'Cumplimiento de proveedores GEMCO', // variable opcional {{panel}} para la plantilla
+  timeoutEnvioMs: 15000,
   esperaReenvioSeg: 45,
   vigenciaCodigoMs: 15 * 60 * 1000,
   autorizados: [
@@ -73,9 +75,36 @@ function irAPaso2(email) {
   $('in-codigo').focus();
 }
 
-function enviar(email, codigo) {
-  if (typeof emailjs === 'undefined') return Promise.reject(new Error('EmailJS no cargó'));
-  return emailjs.send(ACCESO.emailjs.serviceId, ACCESO.emailjs.templateId, { to_email: email, codigo }, { publicKey: ACCESO.emailjs.publicKey });
+// Traduce el error de EmailJS / red a un motivo legible.
+function motivo(err) {
+  if (err && typeof err.status === 'number') {
+    return err.status === 0 ? 'sin conexión con api.emailjs.com (red o firewall)'
+      : `EmailJS respondió ${err.status}${err.text ? ` (${err.text})` : ''}`;
+  }
+  if (err instanceof TypeError) return 'sin conexión con api.emailjs.com (red o firewall)';
+  return (err && err.message) || 'error desconocido';
+}
+
+// emailjs.send con timeout: si api.emailjs.com no responde, la promesa del SDK
+// queda pendiente para siempre; el timeout garantiza una salida.
+async function enviar(email, codigo) {
+  if (typeof emailjs === 'undefined') throw new Error('no se cargó la librería de EmailJS (revisa la conexión o un bloqueador)');
+  const seg = Math.round(ACCESO.timeoutEnvioMs / 1000);
+  let timer;
+  const limite = new Promise((_, rechazar) => {
+    timer = setTimeout(() => rechazar(new Error(`api.emailjs.com no respondió en ${seg} s (posible bloqueo de red o firewall)`)), ACCESO.timeoutEnvioMs);
+  });
+  try {
+    return await Promise.race([
+      emailjs.send(ACCESO.emailjs.serviceId, ACCESO.emailjs.templateId, { to_email: email, codigo, panel: ACCESO.nombrePanel }),
+      limite,
+    ]);
+  } catch (err) {
+    console.error('EmailJS:', err);
+    throw new Error(motivo(err));
+  } finally {
+    clearTimeout(timer);
+  }
 }
 function guardarPendiente(email, codigo) {
   ss.set(K.email, email);
@@ -83,41 +112,48 @@ function guardarPendiente(email, codigo) {
   ss.set(K.vence, String(Date.now() + ACCESO.vigenciaCodigoMs));
 }
 
-function enviarCodigo(e) {
+async function enviarCodigo(e) {
   e.preventDefault();
   const msg1 = $('msg1');
+  const btn = $('btn-enviar');
+  if (btn.disabled) return;
   const email = normEmail($('in-email').value);
   if (!esAutorizado(email)) { mensaje(msg1, 'Correo no autorizado.', 'err'); return; }
   const codigo = generarCodigo();
-  const btn = $('btn-enviar');
   btn.disabled = true;
+  btn.textContent = 'Enviando…';
   ocultar(msg1);
-  enviar(email, codigo).then(() => {
+  try {
+    await enviar(email, codigo);
     guardarPendiente(email, codigo);
-    btn.disabled = false;
     irAPaso2(email);
     mensaje($('msg2'), 'Código enviado a tu correo, revisa tu bandeja de entrada.', 'ok');
     iniciarEspera();
-  }).catch(() => {
+  } catch (err) {
+    mensaje(msg1, `No se pudo enviar el código: ${err.message}`, 'err');
+  } finally {
     btn.disabled = false;
-    mensaje(msg1, 'No se pudo enviar el código. Intenta nuevamente.', 'err');
-  });
+    btn.textContent = 'Enviar código';
+  }
 }
 
-function reenviarCodigo() {
+async function reenviarCodigo() {
   const email = ss.get(K.email);
   if (!email) { irAPaso1(); return; }
   const codigo = generarCodigo();
   const btn = $('btn-reenviar');
   btn.disabled = true;
-  enviar(email, codigo).then(() => {
+  btn.textContent = 'Enviando…';
+  try {
+    await enviar(email, codigo);
     guardarPendiente(email, codigo);
     mensaje($('msg2'), 'Código reenviado a tu correo.', 'ok');
     iniciarEspera();
-  }).catch(() => {
-    mensaje($('msg2'), 'No se pudo reenviar el código. Intenta nuevamente.', 'err');
+  } catch (err) {
+    mensaje($('msg2'), `No se pudo reenviar el código: ${err.message}`, 'err');
     btn.disabled = false;
-  });
+    btn.textContent = 'Reenviar código';
+  }
 }
 
 let temporizador = null;
@@ -161,6 +197,7 @@ function verificarCodigo(e) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  if (typeof emailjs !== 'undefined') emailjs.init({ publicKey: ACCESO.emailjs.publicKey });
   $('paso1').addEventListener('submit', enviarCodigo);
   $('paso2').addEventListener('submit', verificarCodigo);
   $('btn-volver').addEventListener('click', irAPaso1);

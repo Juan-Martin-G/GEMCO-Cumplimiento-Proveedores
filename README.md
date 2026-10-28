@@ -77,6 +77,17 @@ Usa el mismo esquema que el panel EERR:
 
 Para agregar o quitar personas, edita `ACCESO.autorizados` en `login.js` y haz push.
 
+**Si el código no llega:** el envío tiene un timeout de 15 segundos. Si falla, la pantalla muestra "No se pudo enviar el código: <motivo>" y el botón se reactiva. Los motivos posibles son:
+
+- no hubo respuesta de `api.emailjs.com`;
+- no hay conexión;
+- EmailJS respondió con un error HTTP;
+- no cargó la librería de EmailJS.
+
+El navegador necesita llegar a `api.emailjs.com` (y a `cdn.jsdelivr.net` para cargar el SDK). Algunas redes o firewalls bloquean `emailjs.com`; en ese caso el login no funciona desde esa red (el de EERR tampoco), así que prueba desde otra conexión (por ejemplo, los datos del celular).
+
+La plantilla de EmailJS es la misma que usa EERR. Además de `{{to_email}}` y `{{codigo}}`, el login envía `{{panel}}` = "Cumplimiento de proveedores GEMCO". Si la plantilla menciona "EERR" en el asunto o en el cuerpo, se puede cambiar ese texto por `{{panel}}` en el panel de EmailJS (EERR no envía esa variable, así que conviene dejar un valor por defecto o usar una plantilla aparte).
+
 **Limitaciones (es una barrera básica, no seguridad real):** todo se valida en el navegador. El código se genera y se verifica en el cliente, y la lista de correos y la Public Key de EmailJS quedan visibles en el código fuente. Cualquiera puede abrir `panel.html` copiando una sesión falsa en `sessionStorage`. Aun así, en este proyecto **no hay datos que exponer**: el sitio y el repo no contienen números, y el panel no muestra nada hasta que alguien carga su propio Excel. El login sirve para evitar accesos casuales e indexación (`noindex`).
 
 ## Supuestos y limitaciones
