@@ -1323,13 +1323,28 @@ const UI = (() => {
   return { init };
 })();
 
+/* Acceso: sin sesión iniciada en index.html se vuelve al login (barrera básica, ver README). */
+const SESION = { auth: 'gcp_auth', email: 'gcp_auth_email' };
+function sesionActiva() {
+  try { return sessionStorage.getItem(SESION.auth) === 'true'; } catch (e) { return false; }
+}
+
 /* Tema guardado: se aplica antes de pintar para evitar parpadeo. */
 if (typeof document !== 'undefined') {
+  if (!sesionActiva()) location.replace('index.html');
   try {
     const t = localStorage.getItem('tema');
     if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
   } catch (e) { /* sin almacenamiento */ }
-  document.addEventListener('DOMContentLoaded', () => UI.init());
+  document.addEventListener('DOMContentLoaded', () => {
+    UI.init();
+    const salir = document.getElementById('btn-salir');
+    try { salir.title = `Sesión: ${sessionStorage.getItem(SESION.email) || ''}`; } catch (e) { /* sin almacenamiento */ }
+    salir.addEventListener('click', () => {
+      try { Object.values(SESION).forEach(k => sessionStorage.removeItem(k)); } catch (e) { /* sin almacenamiento */ }
+      location.replace('index.html');
+    });
+  });
 }
 
 if (typeof module !== 'undefined' && module.exports) module.exports = { CONFIG, Engine };

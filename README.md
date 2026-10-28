@@ -6,7 +6,8 @@ Página web que muestra de forma visual e interactiva el cumplimiento de proveed
 
 ## Qué hace
 
-- Lee el Excel **100 % en el navegador** con [SheetJS](https://sheetjs.com/). El archivo no se sube a ningún servidor, no se guarda y desaparece al cerrar o recargar la pestaña. Además, la página declara `connect-src 'none'` en su política de seguridad (CSP), así que no puede enviar datos a ningún lado.
+- Lee el Excel **100 % en el navegador** con [SheetJS](https://sheetjs.com/). El archivo no se sube a ningún servidor, no se guarda y desaparece al cerrar o recargar la pestaña. Además, el panel declara `connect-src 'none'` en su política de seguridad (CSP), así que no puede enviar datos a ningún lado.
+- El acceso pide un correo autorizado y un código de 6 dígitos enviado por email (ver [Control de acceso](#control-de-acceso)).
 - Recalcula, desde las bases `BBDD Facturacion` y `BBDD BO abiertas`, lo mismo que calculan las hojas de marca del Excel y lo muestra en cuatro vistas:
   1. **Resumen**: una fila por marca con moneda, facturación, BO abierto, Fact+BO, forecast anual, cumplimiento anual (Excel), cumplimiento YTD (calculado por la app) y mini-barras Q1–Q4. Se puede ordenar y filtrar por "solo con forecast".
   2. **Ficha por marca**: KPIs, gráfico mensual (facturación + BO con la línea de forecast), cumplimiento trimestral, desglose por categoría, tablas de BO abiertas y de facturas (con búsqueda, orden y exportación CSV). Si la hoja tiene bloque de año fiscal USA, aparece un selector *Año calendario / Año fiscal USA*.
@@ -17,7 +18,7 @@ Página web que muestra de forma visual e interactiva el cumplimiento de proveed
 ## Cómo actualizar
 
 1. Actualiza el Excel como siempre y **guárdalo desde Excel** para que queden calculados los valores de las fórmulas.
-2. Abre la página (o `index.html` en local) y arrastra o selecciona el `.xlsx`.
+2. Abre la página (o `index.html` en local), ingresa con tu correo autorizado y el código que llega por email, y arrastra o selecciona el `.xlsx`.
 3. Revisa la pestaña **Conciliación**: todo debería aparecer con ✔.
 
 No hay que subir nada al repositorio. Los datos nunca se commitean: `.gitignore` excluye `*.xlsx`, `*.xls`, `*.csv` y `data/`.
@@ -66,6 +67,18 @@ Si en algún momento cambias los nombres de las hojas o de las columnas, ajusta 
 - **Fecha de corte**: es la fecha máxima de cada BBDD y se muestran ambas. El *mes de corte* del YTD es el de la fecha más reciente entre las dos.
 - **Q4 parcial**: un trimestre se marca *parcial* cuando la fecha de corte cae dentro de él y antes de su último mes.
 
+## Control de acceso
+
+Usa el mismo esquema que el panel EERR:
+
+1. `index.html` pide el correo y lo compara (sin distinguir mayúsculas) contra la lista `ACCESO.autorizados` de `login.js`. Si no está en la lista, muestra "Correo no autorizado".
+2. Si está autorizado, genera un código de 6 dígitos que vence en 15 minutos y lo envía con EmailJS (plantilla con las variables `{{to_email}}` y `{{codigo}}`). Hay que esperar 45 segundos entre reenvíos.
+3. Con el código correcto, guarda la sesión en `sessionStorage` (claves `gcp_*`, distintas de las de EERR) y abre `panel.html`. El panel vuelve al login si no hay sesión. La sesión se pierde con **Cerrar sesión** o al cerrar la pestaña.
+
+Para agregar o quitar personas, edita `ACCESO.autorizados` en `login.js` y haz push.
+
+**Limitaciones (es una barrera básica, no seguridad real):** todo se valida en el navegador. El código se genera y se verifica en el cliente, y la lista de correos y la Public Key de EmailJS quedan visibles en el código fuente. Cualquiera puede abrir `panel.html` copiando una sesión falsa en `sessionStorage`. Aun así, en este proyecto **no hay datos que exponer**: el sitio y el repo no contienen números, y el panel no muestra nada hasta que alguien carga su propio Excel. El login sirve para evitar accesos casuales e indexación (`noindex`).
+
 ## Supuestos y limitaciones
 
 - Solo se leen las **hojas de marca visibles** (A2 = "Item" y A6 = "Forecast"). Las hojas ocultas se ignoran por completo, porque usan columnas antiguas y no están vigentes.
@@ -74,12 +87,14 @@ Si en algún momento cambias los nombres de las hojas o de las columnas, ajusta 
 - El YTD incluye el mes de corte **completo**, aunque ese mes todavía no termine. Por eso, a comienzos de mes puede subestimar el cumplimiento.
 - El BO de cada período considera solo las OC fechadas dentro del período, igual que el Excel. En la tabla de BO de la ficha se pueden incluir las OC de otros períodos.
 - Tolerancias de conciliación: 0,01 en montos y 0,0001 en porcentajes (configurables en `CONFIG.tolerancia`).
-- Requiere conexión a internet para descargar SheetJS y Chart.js desde cdnjs (con verificación de integridad SRI). El Excel nunca sale del equipo.
+- Requiere conexión a internet para descargar SheetJS y Chart.js (cdnjs) y el SDK de EmailJS (jsDelivr), todos con verificación de integridad SRI. El Excel nunca sale del equipo.
 
 ## Estructura
 
 ```
-index.html   página y vista "Cómo se calcula"
+index.html   login (correo autorizado + código por email)
+login.js     configuración de EmailJS, lista de autorizados y flujo del login
+panel.html   la aplicación y la vista "Cómo se calcula"
 app.js       CONFIG (semáforo, tolerancias, hojas) + motor de cálculo + interfaz
 styles.css   estilos, modo claro/oscuro y diseño responsive
 ```

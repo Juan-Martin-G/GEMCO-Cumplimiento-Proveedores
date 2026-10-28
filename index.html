@@ -3,128 +3,41 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- connect-src 'none': la página no puede enviar datos a ningún servidor. -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self' file:; script-src 'self' file: https://cdnjs.cloudflare.com; style-src 'self' file: 'unsafe-inline'; img-src 'self' file: data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'">
+  <!-- El login solo puede conectarse a EmailJS (envío del código). -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' file:; script-src 'self' file: https://cdn.jsdelivr.net; style-src 'self' file: 'unsafe-inline'; img-src 'self' file: data:; connect-src https://api.emailjs.com; form-action 'none'; base-uri 'none'; object-src 'none'">
   <meta name="referrer" content="no-referrer">
-  <meta name="description" content="Cumplimiento de proveedores GEMCO: carga el Excel y se procesa localmente en el navegador.">
-  <title>Cumplimiento de proveedores · GEMCO</title>
+  <meta name="robots" content="noindex, nofollow">
+  <title>Ingreso · Cumplimiento de proveedores GEMCO</title>
   <link rel="stylesheet" href="styles.css">
-  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" integrity="sha384-vtjasyidUo0kW94K5MXDXntzOJpQgBKXmE7e2Ga4LG0skTTLeBi97eFAXsqewJjw" crossorigin="anonymous"></script>
-  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD" crossorigin="anonymous"></script>
-  <script src="app.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4.4.1/dist/email.min.js" integrity="sha384-SALc35EccAf6RzGw4iNsyj7kTPr33K7RoGzYu+7heZhT8s0GZouafRiCg1qy44AS" crossorigin="anonymous"></script>
+  <script defer src="login.js"></script>
 </head>
-<body>
-  <header class="topbar">
-    <div class="topbar-in">
-      <div class="marca-app">
-        <span class="logo" aria-hidden="true">G</span>
-        <span><strong>GEMCO</strong> · Cumplimiento de proveedores</span>
-      </div>
-      <nav id="tabs" class="tabs" role="tablist" aria-label="Vistas" hidden>
-        <button type="button" role="tab" data-ir="resumen" aria-selected="true">Resumen</button>
-        <button type="button" role="tab" data-ir="ficha" aria-selected="false">Ficha por marca</button>
-        <button type="button" role="tab" data-ir="conciliacion" aria-selected="false">Conciliación</button>
-        <button type="button" role="tab" data-ir="metodo" aria-selected="false">Cómo se calcula</button>
-      </nav>
-      <div class="acciones">
-        <button type="button" id="btn-recargar" class="btn-sec" hidden>Cargar otro Excel</button>
-        <button type="button" id="btn-tema" class="btn-icono" aria-label="Cambiar tema">☾</button>
-      </div>
-    </div>
-  </header>
-
-  <main class="contenedor">
-    <!-- Pantalla de carga -->
-    <section id="carga" class="carga">
+<body class="login-body">
+  <main class="login-card">
+    <div class="login-brand">
+      <span class="logo" aria-hidden="true">G</span>
       <h1>Cumplimiento de proveedores</h1>
-      <p class="sub">Arrastra el Excel consolidado o selecciónalo desde tu equipo.</p>
-      <div id="zona" class="zona" tabindex="0" role="button" aria-label="Seleccionar archivo Excel">
-        <div class="zona-icono" aria-hidden="true">⬆</div>
-        <p><strong>Arrastra aquí el archivo .xlsx</strong></p>
-        <p class="muted">o</p>
-        <button type="button" id="btn-elegir" class="btn">Seleccionar archivo</button>
-        <input type="file" id="archivo" accept=".xlsx,.xlsm,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden>
-      </div>
-      <p id="estado-carga" class="estado-carga" role="status" aria-live="polite"></p>
-      <div class="privacidad">
-        <span aria-hidden="true">🔒</span>
-        <div>
-          <strong>El archivo no sale de tu equipo.</strong>
-          Se lee y se calcula completamente en este navegador (SheetJS). La página no envía datos a ningún servidor
-          y no guarda el Excel: al cerrar o recargar la pestaña, los datos desaparecen.
-        </div>
-      </div>
-    </section>
-
-    <!-- Aplicación -->
-    <div id="app" hidden>
-      <div id="banner" class="banner" role="alert" hidden></div>
-      <div id="meta" class="meta"></div>
-
-      <section id="vista-resumen" class="vista"></section>
-      <section id="vista-ficha" class="vista" hidden></section>
-      <section id="vista-conciliacion" class="vista" hidden></section>
-
-      <section id="vista-metodo" class="vista" hidden>
-        <div class="encabezado-vista"><div>
-          <h1>Cómo se calcula</h1>
-          <p class="sub">Cada métrica replica una fórmula del Excel, salvo el cumplimiento YTD, que es nuevo y lo calcula la app.</p>
-        </div></div>
-
-        <section class="panel">
-          <div class="tabla-wrap">
-            <table class="tabla tabla-metodo">
-              <thead><tr><th>Métrica</th><th>Cómo la calcula la app</th><th>Equivalente en el Excel (hoja de marca)</th></tr></thead>
-              <tbody>
-                <tr><th scope="row">Facturación</th>
-                  <td>Σ <code>BBDD Facturacion</code> col. "Total moneda marca" donde Proveedor (trim) = marca, Año = año y Mes = mes de "Fecha de contabilización".</td>
-                  <td>Fila 3 · ej. <code>Steelco!B3 = SUMIFS('BBDD Facturacion'!$R:$R, …$C:$C, $A$1, …$F:$F, B$2, …$E:$E, B$1)</code> · total en <code>R3</code></td></tr>
-                <tr><th scope="row">Backorder (BO)</th>
-                  <td>Σ <code>BBDD BO abiertas</code> col. "Total moneda marca" donde Marca (trim) = marca, Año OC = año y Mes = mes de "Fecha OC". Filas con Cantidad pdte = 0 suman 0. Solo OC del período.</td>
-                  <td>Fila 4 · <code>SUMIFS('BBDD BO abiertas'!$S:$S, …$K:$K, $A$1, …$D:$D, B$2, …$C:$C, B$1)</code> · total en <code>R4</code></td></tr>
-                <tr><th scope="row">Fact + BO</th><td>Facturación + Backorder.</td><td>Fila 5 · <code>B3+B4</code> · total <code>R5</code></td></tr>
-                <tr><th scope="row">Forecast</th>
-                  <td>Input manual de la fila 6. Trimestral = celdas de trimestre; anual = celda Total; mensual = celdas de mes. Si los 3 meses de un trimestre están vacíos y el trimestre tiene valor, se usa trimestre / 3 marcado "derivado" (línea punteada). Forecast 0 o vacío = <strong>sin forecast</strong>: se muestra "—", nunca 0%.</td>
-                  <td>Fila 6 · <code>E6, I6, M6, Q6</code> (trimestres) · <code>R6</code> (total)</td></tr>
-                <tr><th scope="row">Cumplimiento trimestral</th><td>Fact+BO del trimestre / Forecast del trimestre.</td><td>Fila 7 · <code>E7 = IFERROR(E5/E6,0)</code>, también <code>I7, M7, Q7</code></td></tr>
-                <tr><th scope="row">Cumplimiento anual (Excel)</th><td>Fact+BO total / Forecast total. Compara lo acumulado contra 12 meses de forecast.</td><td>Fila 7 · <code>R7 = IFERROR(R5/R6,0)</code></td></tr>
-                <tr class="resaltar"><th scope="row">Cumplimiento YTD <span class="tag tag-app">calculada por la app</span></th>
-                  <td>Fact+BO de enero al mes de corte / Σ Forecast mensual de enero al mes de corte. <strong>Incluye el mes de corte completo</strong>. Mes de corte = mes de la fecha más reciente entre ambas BBDD. En el bloque fiscal se acumula desde el primer mes del bloque.</td>
-                  <td>No existe en el Excel. Motivo: el anual compara lo acumulado contra 12 meses de forecast, y Q4 compara solo lo que va del trimestre contra el trimestre completo (por eso Q4 se marca <em>parcial</em> mientras el corte sea anterior a diciembre).</td></tr>
-                <tr><th scope="row">Desglose por categoría</th>
-                  <td>Facturación por "Categoria" y BO por "Grupo". Estándar: Equipos, Repuestos, Accesorios, Consumibles. Cualquier otro valor (0, vacío, "ERROR", "No aplica Meta"…) va a <strong>Sin categoría</strong>, visible.</td>
-                  <td>Filas 11–15 (BO) y 19–23 (facturación); columna S = % de participación. Los totales de las filas 15 y 23 suman solo las 4 categorías estándar.</td></tr>
-                <tr><th scope="row">Año fiscal USA</th>
-                  <td>Misma lógica con los pares año/mes de las filas 1–2 del bloque fiscal. Se detecta buscando "Item" en la fila 2 a la derecha de la columna S.</td>
-                  <td>Pentax y Durr Dental: columnas U–AL · G-Flex: V–AM</td></tr>
-                <tr><th scope="row">Fecha de corte</th><td>Máxima fecha de cada BBDD ("Fecha de contabilización" y "Fecha OC"). Se muestran ambas arriba.</td><td>—</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        <div class="grid-2 grid-texto">
-          <section class="panel">
-            <h2>Monedas</h2>
-            <p>Cada marca se reporta en su "Moneda marca" y la app suma <strong>siempre</strong> "Total moneda marca" (nunca "Total documento (ME)" ni "Total Neto ME"). Entre marcas distintas nunca se suman montos: la vista general compara solo porcentajes y conteos.</p>
-            <p>Los documentos en otra moneda ya vienen convertidos en el Excel: <code>Total moneda marca = monto original × TC a moneda marca</code>, con el TC tomado de "Parametros Moneda" (D:E). La ficha muestra un recuadro <em>Conversión de moneda</em> con el monto original, el TC y el monto convertido.</p>
-            <p class="muted" id="metodo-moneda"></p>
-          </section>
-          <section class="panel">
-            <h2>Semáforo y conciliación</h2>
-            <p>Semáforo (en <code>CONFIG.semaforo</code>, al inicio de app.js): rojo bajo <span data-cfg="amarillo"></span>, amarillo entre <span data-cfg="amarillo"></span> y <span data-cfg="verde"></span>, verde desde <span data-cfg="verde"></span>, gris = sin forecast.</p>
-            <p>La conciliación recalcula cada hoja de marca visible desde las BBDD y la compara con los valores cacheados (guardados por Excel) de las filas 3–7, el cumplimiento de cada trimestre y los totales de las filas 15 y 23. Tolerancia: <span data-cfg="tolMonto"></span> en montos y <span data-cfg="tolPct"></span> en %.</p>
-            <p>Se leen solo las hojas de marca <strong>visibles</strong> (A2 = "Item", A6 = "Forecast"); la clave de marca es A1 con trim. La hoja oculta <code>"BBDD Facturacion␣"</code> (con espacio final) es una base antigua y no se lee nunca.</p>
-          </section>
-        </div>
-      </section>
+      <p class="muted">Acceso restringido · ingresa con tu correo autorizado</p>
     </div>
+
+    <form id="paso1" class="login-paso" novalidate>
+      <label for="in-email">Correo</label>
+      <input id="in-email" type="email" placeholder="nombre@empresa.cl" autocomplete="email" required>
+      <button type="submit" class="btn btn-ancho" id="btn-enviar">Enviar código</button>
+      <p class="login-msg" id="msg1" role="status" aria-live="polite" hidden></p>
+    </form>
+
+    <form id="paso2" class="login-paso" novalidate hidden>
+      <p class="login-eco">Código enviado a <strong id="email-eco"></strong></p>
+      <label for="in-codigo">Código de 6 dígitos</label>
+      <input id="in-codigo" class="login-codigo" type="text" inputmode="numeric" maxlength="6" placeholder="······" autocomplete="one-time-code" required>
+      <button type="submit" class="btn btn-ancho" id="btn-ingresar">Ingresar</button>
+      <div class="login-links">
+        <button type="button" class="link-sec" id="btn-volver">Volver a ingresar correo</button>
+        <button type="button" class="link-sec" id="btn-reenviar">Reenviar código</button>
+      </div>
+      <p class="login-msg" id="msg2" role="status" aria-live="polite" hidden></p>
+    </form>
   </main>
-
-  <footer class="pie contenedor">
-    Los datos se procesan solo en este navegador · Formato numérico es-CL · Librerías: SheetJS y Chart.js (CDN)
-  </footer>
-
-  <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
 </body>
 </html>
