@@ -1,13 +1,23 @@
-# Datos: NUNCA se suben al repo (el repo es público)
+# Excel fuente: NUNCA se sube (el repo es público)
+data/raw/*.xlsx
+data/raw/**
+!data/raw/.gitkeep
+# Cualquier Excel/CSV en cualquier carpeta (incluidas subcarpetas como Old/)
 *.xlsx
 *.xlsm
 *.xlsb
 *.xls
 *.csv
 *.ods
-data/
 Old/
 ~$*
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
 
 # Sistema / editores
 .DS_Store

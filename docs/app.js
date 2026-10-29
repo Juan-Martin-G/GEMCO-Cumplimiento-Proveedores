@@ -1,11 +1,12 @@
 /*
- * Cumplimiento de proveedores · GEMCO
- * Todo el Excel se procesa en el navegador. Ningún dato sale del equipo.
+ * Cumplimiento de proveedores · GEMCO — panel
+ * Lee los datos precalculados por generar_datos.py (datos_cumplimiento.json).
  *
  * Estructura:
- *   CONFIG  → parámetros editables (semáforo, tolerancias, nombres de hojas)
- *   Engine  → lectura del libro, cálculos y conciliación (sin DOM; se puede ejecutar en Node)
- *   UI      → vistas, gráficos y tablas
+ *   CONFIG → parámetros de presentación (semáforo, formato)
+ *   Util   → utilidades de meses y celdas
+ *   Datos  → carga del JSON y adaptación al modelo que usa la interfaz
+ *   UI     → vistas, gráficos y tablas
  */
 'use strict';
 
@@ -16,472 +17,98 @@ const CONFIG = {
   //   cumplimiento ≥ verdeDesde                 → verde
   //   sin forecast                              → gris
   semaforo: { amarilloDesde: 0.80, verdeDesde: 1.00 },
-
-  // Tolerancias de la conciliación contra los valores cacheados del Excel.
-  tolerancia: { monto: 0.01, pct: 0.0001 },
-
-  // Nombres EXACTOS de las hojas (sin trim). Ojo: existe una hoja oculta
-  // "BBDD Facturacion " (con espacio final) que NO debe leerse nunca.
-  hojas: {
-    facturacion: 'BBDD Facturacion',
-    bo: 'BBDD BO abiertas',
-    moneda: 'Parametros Moneda',
-  },
-
-  encabezados: {
-    facturacion: ['Proveedor', 'Fecha de contabilización', 'Año', 'Mes', 'Número de folio', 'Comentarios',
-      'Orden de compra', 'Categoria', 'Moneda del documento', 'Total documento (ME)', 'Moneda marca',
-      'TC a moneda marca', 'Total moneda marca'],
-    bo: ['Fecha OC', 'Año OC', 'Mes', 'Referencia', 'Producto', 'Descripcion', 'Grupo', 'Marca',
-      'Cantidad pdte', 'moneda', 'Precio', 'Total Neto ME', 'Moneda marca', 'TC a moneda marca',
-      'Total moneda marca'],
-  },
-
-  categorias: ['Equipos', 'Repuestos', 'Accesorios', 'Consumibles'],
-  sinCategoria: 'Sin categoría',
+  archivoDatos: 'datos_cumplimiento.json',
   locale: 'es-CL',
 };
 
 /* ===================================================================== */
-/*  Engine                                                               */
+/*  Util                                                                 */
 /* ===================================================================== */
 
-const Engine = (() => {
+const Util = (() => {
   const MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto',
     'septiembre', 'octubre', 'noviembre', 'diciembre'];
   const MESES_CORTOS = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
-
   // Desplazamientos relativos a la columna de etiquetas ("Item") de cada bloque.
-  const LAYOUT = { meses: [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15], trimestres: [4, 8, 12, 16], total: 17, pct: 18 };
-  const FILA = { fact: 3, bo: 4, factbo: 5, forecast: 6, cumpl: 7, boTotal: 15, factTotal: 23 };
-
-  class ErrorCarga extends Error {}
-
-  const txt = v => (v == null ? '' : String(v)).trim();
-  const clave = v => txt(v).toLowerCase();
+  const LAYOUT = { meses: [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15], trimestres: [4, 8, 12, 16], total: 17 };
 
   function colLetra(c) {
     let s = '';
     for (let n = c + 1; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + ((n - 1) % 26)) + s;
     return s;
   }
-  function colIndice(letras) {
-    let n = 0;
-    for (const ch of letras) n = n * 26 + (ch.charCodeAt(0) - 64);
-    return n - 1;
-  }
-  function rango(ref) {
-    const m = /^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/.exec(ref || '');
-    if (!m) return null;
-    return { c0: colIndice(m[1]), r0: +m[2] - 1, c1: colIndice(m[3] || m[1]), r1: +(m[4] || m[2]) - 1 };
-  }
-  const dir = (r, c) => colLetra(c) + (r + 1);
-  const celda = (ws, r, c) => ws[dir(r, c)];
-  const valor = (ws, r, c) => { const x = celda(ws, r, c); return x ? x.v : null; };
   const refHoja = h => (/^[A-Za-z0-9_]+$/.test(h) ? h : `'${h.replace(/'/g, "''")}'`);
-
-  // null = vacía · NaN = no numérica (texto, error #N/A, etc.)
-  function numero(c) {
-    if (!c || c.t === 'z') return null;
-    if (c.t === 'n') return c.v;
-    if (c.t === 's' && c.v.trim() === '') return null;
-    return NaN;
-  }
-  // Fecha local redondeada al minuto (SheetJS puede dejar desfases de segundos por zona horaria).
-  function fechaLocal(c) {
-    if (!c || !(c.v instanceof Date) || isNaN(c.v)) return null;
-    return new Date(Math.round(c.v.getTime() / 60000) * 60000);
-  }
-  const soloDia = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  const idxMes = (anio, mes) => anio * 12 + mes;
   const mesCorto = (anio, mes) => `${MESES_CORTOS[mes]}-${String(anio).slice(2)}`;
-
-  function categoria(v) {
-    const k = clave(v);
-    return CONFIG.categorias.find(c => c.toLowerCase() === k) || CONFIG.sinCategoria;
-  }
-  const todasCategorias = () => [...CONFIG.categorias, CONFIG.sinCategoria];
-  const vacioCat = () => Object.fromEntries(todasCategorias().map(c => [c, 0]));
-
-  function hojaOculta(wb, nombre) {
-    const i = wb.SheetNames.indexOf(nombre);
-    const m = wb.Workbook && wb.Workbook.Sheets && wb.Workbook.Sheets[i];
-    return !!(m && m.Hidden);
-  }
-
-  /* ---------- Lectura de tablas por encabezado ---------- */
-
-  function leerTabla(wb, nombre, requeridos) {
-    // Búsqueda por nombre EXACTO: "BBDD Facturacion" ≠ "BBDD Facturacion ".
-    if (!wb.SheetNames.includes(nombre)) {
-      throw new ErrorCarga(`No se encontró la hoja "${nombre}" (se busca por nombre exacto). ` +
-        `Hojas del libro: ${wb.SheetNames.map(n => `"${n}"`).join(', ')}.`);
-    }
-    const ws = wb.Sheets[nombre];
-    const rg = rango(ws['!ref']);
-    if (!rg) throw new ErrorCarga(`La hoja "${nombre}" está vacía.`);
-    const col = {};
-    for (let c = rg.c0; c <= rg.c1; c++) {
-      const h = txt(valor(ws, rg.r0, c));
-      if (h && !(h in col)) col[h] = c;
-    }
-    const faltan = requeridos.filter(h => !(h in col));
-    if (faltan.length) {
-      throw new ErrorCarga(`La hoja "${nombre}" no tiene los encabezados requeridos: ` +
-        `${faltan.map(h => `"${h}"`).join(', ')}. Se detuvo la carga para no leer una base equivocada.`);
-    }
-    const filas = [];
-    for (let r = rg.r0 + 1; r <= rg.r1; r++) {
-      const fila = { fila: r + 1, c: {} };
-      let vacia = true;
-      for (const h of requeridos) {
-        const x = celda(ws, r, col[h]);
-        fila.c[h] = x;
-        if (x && txt(x.v) !== '') vacia = false;
-      }
-      if (!vacia) filas.push(fila);
-    }
-    return { nombre, filas, oculta: hojaOculta(wb, nombre), columnas: col };
-  }
-
-  /* ---------- Normalización de BBDD ---------- */
-
-  const MAPEO = {
-    fact: { marca: 'Proveedor', fecha: 'Fecha de contabilización', anio: 'Año', mes: 'Mes',
-      monedaOrig: 'Moneda del documento', montoOrig: 'Total documento (ME)', grupo: 'Categoria' },
-    bo: { marca: 'Marca', fecha: 'Fecha OC', anio: 'Año OC', mes: 'Mes',
-      monedaOrig: 'moneda', montoOrig: 'Total Neto ME', grupo: 'Grupo' },
+  const soloDia = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  // 'YYYY-MM-DD' → Date local (sin desfase de zona horaria)
+  const fecha = s => {
+    if (!s) return null;
+    const [y, m, d] = s.split('-').map(Number);
+    return new Date(y, m - 1, d);
   };
 
-  function normalizar(tabla, tipo, chk) {
-    const m = MAPEO[tipo];
-    const registros = [];
-    let corte = null;
-    for (const f of tabla.filas) {
-      const c = f.c;
-      const fecha = fechaLocal(c[m.fecha]);
-      if (!fecha) { chk.fechas.push(`${tabla.nombre} fila ${f.fila}`); continue; }
-      if (!corte || fecha > corte) corte = fecha;
-      const anio = fecha.getFullYear(), mes = fecha.getMonth();
-      const anioCache = numero(c[m.anio]);
-      if (anioCache !== anio || clave(c[m.mes] && c[m.mes].v) !== MESES[mes]) chk.anioMes.push(`${tabla.nombre} fila ${f.fila}`);
-
-      const total = numero(c['Total moneda marca']);
-      if (Number.isNaN(total)) chk.totales.push(`${tabla.nombre} fila ${f.fila}`);
-      const tc = numero(c['TC a moneda marca']);
-      if (tc === null || Number.isNaN(tc)) chk.tc.push(`${tabla.nombre} fila ${f.fila} ("${txt(c['TC a moneda marca'] && c['TC a moneda marca'].v)}")`);
-      const montoOrig = numero(c[m.montoOrig]);
-
-      const reg = {
-        tipo, fila: f.fila, fecha, anio, mes,
-        marca: txt(c[m.marca] && c[m.marca].v),
-        marcaClave: clave(c[m.marca] && c[m.marca].v),
-        monedaOrig: txt(c[m.monedaOrig] && c[m.monedaOrig].v),
-        montoOrig: Number.isFinite(montoOrig) ? montoOrig : 0,
-        monedaMarca: txt(c['Moneda marca'] && c['Moneda marca'].v),
-        tc: Number.isFinite(tc) ? tc : null,
-        total: Number.isFinite(total) ? total : 0,
-        catRaw: txt(c[m.grupo] && c[m.grupo].v),
-        cat: categoria(c[m.grupo] && c[m.grupo].v),
-      };
-      if (tipo === 'fact') {
-        reg.folio = txt(c['Número de folio'] && c['Número de folio'].v);
-        reg.comentarios = txt(c['Comentarios'] && c['Comentarios'].v);
-        reg.oc = txt(c['Orden de compra'] && c['Orden de compra'].v);
-      } else {
-        const cant = numero(c['Cantidad pdte']);
-        const precio = numero(c['Precio']);
-        reg.referencia = txt(c['Referencia'] && c['Referencia'].v);
-        reg.producto = txt(c['Producto'] && c['Producto'].v);
-        reg.descripcion = txt(c['Descripcion'] && c['Descripcion'].v);
-        reg.cantidad = Number.isFinite(cant) ? cant : 0;
-        reg.precio = Number.isFinite(precio) ? precio : 0;
-      }
-      reg.convertido = !!reg.monedaOrig && clave(reg.monedaOrig) !== clave(reg.monedaMarca);
-      registros.push(reg);
-    }
-    return { registros, corte };
-  }
-
-  // Índice marca|año|mes → { total, cat, filas }
-  function indexar(registros) {
-    const idx = new Map();
-    for (const r of registros) {
-      const k = `${r.marcaClave}|${r.anio}|${r.mes}`;
-      let e = idx.get(k);
-      if (!e) { e = { total: 0, cat: vacioCat(), filas: [] }; idx.set(k, e); }
-      e.total += r.total;
-      e.cat[r.cat] += r.total;
-      e.filas.push(r);
-    }
-    return idx;
-  }
-
-  /* ---------- Parametros Moneda ---------- */
-
-  function leerParametrosMoneda(wb) {
-    const nombre = CONFIG.hojas.moneda;
-    if (!wb.SheetNames.includes(nombre)) throw new ErrorCarga(`No se encontró la hoja "${nombre}".`);
-    const ws = wb.Sheets[nombre];
-    const rg = rango(ws['!ref']);
-    const marcas = [], pares = {};
-    for (let r = 1; rg && r <= rg.r1; r++) {
-      const marca = valor(ws, r, 0), mon = valor(ws, r, 1);
-      if (txt(marca)) marcas.push({ marca: String(marca), clave: clave(marca), moneda: txt(mon), celda: `A${r + 1}` });
-      const par = txt(valor(ws, r, 3)), tc = numero(celda(ws, r, 4));
-      if (par) pares[par] = { tc: Number.isFinite(tc) ? tc : null, celda: `E${r + 1}` };
-    }
-    return { marcas, pares };
-  }
-
-  /* ---------- Hojas de marca ---------- */
-
-  function leerBloque(ws, hoja, c0, tipo) {
-    const errores = [];
-    const meses = LAYOUT.meses.map(off => {
-      const c = c0 + off;
-      const etiqueta = txt(valor(ws, 1, c));
-      const mes = MESES.indexOf(etiqueta.toLowerCase());
-      const anio = numero(celda(ws, 0, c));
-      if (mes < 0) errores.push(`${hoja}!${dir(1, c)}: se esperaba un mes y dice "${etiqueta}".`);
-      if (!(anio > 0)) errores.push(`${hoja}!${dir(0, c)}: falta el año del mes.`);
-      return { col: c, mes, anio };
-    });
-    LAYOUT.trimestres.forEach((off, q) => {
-      const e = clave(valor(ws, 1, c0 + off));
-      if (e !== `q${q + 1}`) errores.push(`${hoja}!${dir(1, c0 + off)}: se esperaba "Q${q + 1}" y dice "${e}".`);
-    });
-    if (clave(valor(ws, 1, c0 + LAYOUT.total)) !== 'total') errores.push(`${hoja}!${dir(1, c0 + LAYOUT.total)}: se esperaba "Total".`);
-    for (let i = 1; i < 12 && !errores.length; i++) {
-      if (idxMes(meses[i].anio, meses[i].mes) !== idxMes(meses[i - 1].anio, meses[i - 1].mes) + 1) {
-        errores.push(`${hoja}: los meses del bloque no son consecutivos (${dir(1, meses[i].col)}).`);
-      }
-    }
-
-    // Forecast (fila 6): celdas de mes, trimestre y total tal como están en la hoja.
-    const fcCelda = off => {
-      const n = numero(celda(ws, FILA.forecast - 1, c0 + off));
-      return Number.isFinite(n) ? n : null;
-    };
-    const fcMes = LAYOUT.meses.map(fcCelda);
-    const fcTrim = LAYOUT.trimestres.map(fcCelda);
-    const fcTotal = fcCelda(LAYOUT.total);
-    const fcDerivado = Array(12).fill(false);
-    fcTrim.forEach((q, t) => {
-      const ids = [3 * t, 3 * t + 1, 3 * t + 2];
-      if (q > 0 && ids.every(i => !fcMes[i])) ids.forEach(i => { fcMes[i] = q / 3; fcDerivado[i] = true; });
-    });
-
-    const cache = (fila, off) => numero(celda(ws, fila - 1, c0 + off));
-    const ok = !errores.length;
-    const ini = meses[0], fin = meses[11];
-    const titulo = tipo === 'calendario'
-      ? `Año calendario ${ok ? ini.anio : ''}`.trim()
-      : `Año fiscal USA${ok ? ` (${mesCorto(ini.anio, ini.mes)} – ${mesCorto(fin.anio, fin.mes)})` : ''}`;
-    return { tipo, hoja, c0, titulo, meses, errores, fcMes, fcTrim, fcTotal, fcDerivado, cache };
-  }
-
-  function calcularBloque(b, marcaClave, idxF, idxB, corteIdx) {
-    const vacio = { total: 0, cat: vacioCat(), filas: [] };
-    const meses = b.meses.map((m, i) => {
-      const F = idxF.get(`${marcaClave}|${m.anio}|${m.mes}`) || vacio;
-      const B = idxB.get(`${marcaClave}|${m.anio}|${m.mes}`) || vacio;
-      return {
-        anio: m.anio, mes: m.mes, etiqueta: mesCorto(m.anio, m.mes),
-        fact: F.total, bo: B.total, factbo: F.total + B.total,
-        fc: b.fcMes[i], fcDerivado: b.fcDerivado[i],
-        catF: F.cat, catB: B.cat, filasF: F.filas, filasB: B.filas,
-      };
-    });
-    const suma = (arr, k) => arr.reduce((s, x) => s + (x[k] || 0), 0);
-    const trims = [0, 1, 2, 3].map(q => {
-      const ms = meses.slice(3 * q, 3 * q + 3);
-      const fc = b.fcTrim[q];
-      const factbo = suma(ms, 'factbo');
-      const primero = idxMes(ms[0].anio, ms[0].mes), ultimo = idxMes(ms[2].anio, ms[2].mes);
-      const estado = corteIdx >= ultimo ? 'cerrado' : corteIdx >= primero ? 'parcial' : 'futuro';
-      return { nombre: `Q${q + 1}`, meses: ms, fact: suma(ms, 'fact'), bo: suma(ms, 'bo'), factbo,
-        fc, cumpl: fc > 0 ? factbo / fc : null, estado };
-    });
-    const total = { fact: suma(trims, 'fact'), bo: suma(trims, 'bo'), factbo: suma(trims, 'factbo'), fc: b.fcTotal };
-    total.cumpl = total.fc > 0 ? total.factbo / total.fc : null;
-
-    const msYtd = meses.filter(m => idxMes(m.anio, m.mes) <= corteIdx);
-    const ytd = { fact: suma(msYtd, 'fact'), bo: suma(msYtd, 'bo'), factbo: suma(msYtd, 'factbo'),
-      fc: suma(msYtd, 'fc'), nMeses: msYtd.length,
-      desde: meses[0], hasta: msYtd.length ? msYtd[msYtd.length - 1] : null };
-    ytd.cumpl = ytd.fc > 0 ? ytd.factbo / ytd.fc : null;
-    ytd.completo = msYtd.length === 12;
-
-    const catF = vacioCat(), catB = vacioCat(), rawF = {}, rawB = {};
-    for (const m of meses) {
-      for (const c of todasCategorias()) { catF[c] += m.catF[c]; catB[c] += m.catB[c]; }
-      for (const r of m.filasF) if (r.cat === CONFIG.sinCategoria) rawF[r.catRaw || '(vacío)'] = (rawF[r.catRaw || '(vacío)'] || 0) + r.total;
-      for (const r of m.filasB) if (r.cat === CONFIG.sinCategoria) rawB[r.catRaw || '(vacío)'] = (rawB[r.catRaw || '(vacío)'] || 0) + r.total;
-    }
-    const filasF = meses.flatMap(m => m.filasF);
-    const filasB = meses.flatMap(m => m.filasB);
-    const fcSumaMeses = suma(meses, 'fc');
-    const tieneForecast = total.fc > 0;
-    return { meses, trims, total, ytd, catF, catB, rawF, rawB, filasF, filasB, fcSumaMeses, tieneForecast,
-      hayDerivado: b.fcDerivado.some(Boolean) };
-  }
-
-  function conciliarBloque(b, calc) {
-    const tol = CONFIG.tolerancia;
-    const items = [];
-    const T = LAYOUT.total;
-    const add = (concepto, fila, off, app, tipo, nota) => {
-      const ex = b.cache(fila, off);
-      const exV = Number.isFinite(ex) ? ex : (ex === null ? 0 : NaN); // vacío ≙ 0 (IFERROR del Excel)
-      const apV = app == null ? 0 : app;
-      const dif = apV - exV;
-      const ok = Number.isFinite(dif) && Math.abs(dif) <= (tipo === 'pct' ? tol.pct : tol.monto) + 1e-9;
-      items.push({ concepto, celda: `${refHoja(b.hoja)}!${dir(fila - 1, b.c0 + off)}`, excel: ex, app, dif, ok, tipo, nota });
-    };
-    const sum4 = cat => CONFIG.categorias.reduce((s, c) => s + cat[c], 0);
-    add('Facturación total (fila 3)', FILA.fact, T, calc.total.fact, 'monto');
-    add('Backorder total (fila 4)', FILA.bo, T, calc.total.bo, 'monto');
-    add('Fact + BO total (fila 5)', FILA.factbo, T, calc.total.factbo, 'monto');
-    add('Forecast total (fila 6)', FILA.forecast, T, calc.fcSumaMeses, 'monto',
-      calc.hayDerivado ? 'Σ forecast mensual usado por la app (incluye meses derivados = trimestre/3)' : 'Σ forecast mensual usado por la app');
-    add('Cumplimiento total (fila 7)', FILA.cumpl, T, calc.total.cumpl, 'pct',
-      calc.total.cumpl == null ? 'Sin forecast: la app muestra "—"; el Excel muestra 0 por IFERROR' : '');
-    calc.trims.forEach((t, q) => add(`Cumplimiento ${t.nombre} (fila 7)`, FILA.cumpl, LAYOUT.trimestres[q], t.cumpl, 'pct',
-      t.cumpl == null ? 'Sin forecast en el trimestre (Excel: 0 por IFERROR)' : ''));
-    add('Total BO por categoría (fila 15)', FILA.boTotal, T, sum4(calc.catB), 'monto',
-      calc.catB[CONFIG.sinCategoria] ? `Excluye "${CONFIG.sinCategoria}" (${calc.catB[CONFIG.sinCategoria]}), igual que la hoja` : '');
-    add('Total facturación por categoría (fila 23)', FILA.factTotal, T, sum4(calc.catF), 'monto',
-      calc.catF[CONFIG.sinCategoria] ? `Excluye "${CONFIG.sinCategoria}" (${calc.catF[CONFIG.sinCategoria]}), igual que la hoja` : '');
-    return items;
-  }
-
-  /* ---------- Proceso completo ---------- */
-
-  function procesarLibro(wb) {
-    const problemas = [];
-    const chk = { fechas: [], anioMes: [], totales: [], tc: [] };
-
-    const tF = leerTabla(wb, CONFIG.hojas.facturacion, CONFIG.encabezados.facturacion);
-    const tB = leerTabla(wb, CONFIG.hojas.bo, CONFIG.encabezados.bo);
-    const params = leerParametrosMoneda(wb);
-    const nF = normalizar(tF, 'fact', chk);
-    const nB = normalizar(tB, 'bo', chk);
-    const idxF = indexar(nF.registros);
-    const idxB = indexar(nB.registros);
-    const corte = nF.corte && nB.corte ? (nF.corte > nB.corte ? nF.corte : nB.corte) : (nF.corte || nB.corte);
-    const corteIdx = corte ? idxMes(corte.getFullYear(), corte.getMonth()) : Infinity;
-
-    // Info de hojas leídas / ignoradas
-    problemas.push({ nivel: 'ok', titulo: `Se leyó la hoja "${tF.nombre}" (nombre exacto) · ${tF.filas.length} filas · encabezados validados` });
-    problemas.push({ nivel: 'ok', titulo: `Se leyó la hoja "${tB.nombre}" (nombre exacto) · ${tB.filas.length} filas · encabezados validados` });
-    for (const n of wb.SheetNames) {
-      if (n !== tF.nombre && n.trim() === tF.nombre.trim()) {
-        problemas.push({ nivel: 'info', titulo: `Se ignoró la hoja "${n.replace(/ /g, '␣')}"${hojaOculta(wb, n) ? ' (oculta)' : ''}: nombre casi igual a "${tF.nombre}", es la base antigua y no se lee.` });
-      }
-    }
-    if (tF.oculta) problemas.push({ nivel: 'aviso', titulo: `La hoja "${tF.nombre}" está oculta; se esperaba visible.` });
-
-    const lista = (arr, n = 8) => arr.slice(0, n).join(' · ') + (arr.length > n ? ` · … (${arr.length} en total)` : '');
-    if (chk.fechas.length) problemas.push({ nivel: 'error', titulo: `${chk.fechas.length} filas sin fecha válida (no se suman)`, detalle: lista(chk.fechas) });
-    if (chk.totales.length) problemas.push({ nivel: 'error', titulo: `${chk.totales.length} filas con "Total moneda marca" no numérico (se suman como 0)`, detalle: lista(chk.totales) });
-    if (chk.tc.length) problemas.push({ nivel: 'error', titulo: `${chk.tc.length} filas con "TC a moneda marca" no numérico`, detalle: lista(chk.tc) });
-    else problemas.push({ nivel: 'ok', titulo: 'Todos los "TC a moneda marca" son numéricos' });
-    if (chk.anioMes.length) problemas.push({ nivel: 'aviso', titulo: `${chk.anioMes.length} filas donde Año/Mes cacheados no coinciden con la fecha (la app usa la fecha)`, detalle: lista(chk.anioMes) });
-    else problemas.push({ nivel: 'ok', titulo: 'Año y Mes derivados de la fecha coinciden con las columnas del Excel en todas las filas' });
-
-    // Hojas de marca visibles
-    const ocultas = [];
-    const marcas = [];
-    wb.SheetNames.forEach(nombre => {
-      if (hojaOculta(wb, nombre)) { ocultas.push(nombre); return; }
-      const ws = wb.Sheets[nombre];
-      if (clave(valor(ws, 1, 0)) !== 'item' || clave(valor(ws, 5, 0)) !== 'forecast') return;
-      const nombreMarca = txt(valor(ws, 0, 0));
-      const mc = clave(nombreMarca);
-      const bloques = [leerBloque(ws, nombre, 0, 'calendario')];
-      const rg = rango(ws['!ref']);
-      for (let c = 19; rg && c <= rg.c1; c++) {
-        if (clave(valor(ws, 1, c)) === 'item') { bloques.push(leerBloque(ws, nombre, c, 'fiscal')); break; }
-      }
-      for (const b of bloques) {
-        if (b.errores.length) {
-          problemas.push({ nivel: 'error', titulo: `Hoja "${nombre}", bloque ${b.tipo}: estructura inesperada`, detalle: b.errores.join(' ') });
-          b.calc = null; b.conc = [];
-          continue;
-        }
-        b.calc = calcularBloque(b, mc, idxF, idxB, corteIdx);
-        b.conc = conciliarBloque(b, b.calc);
-      }
-
-      // Moneda marca única en ambas BBDD
-      const regs = [...nF.registros.filter(r => r.marcaClave === mc), ...nB.registros.filter(r => r.marcaClave === mc)];
-      const porMoneda = {};
-      for (const r of regs) {
-        const k = r.monedaMarca && r.monedaMarca !== '0' ? r.monedaMarca : '(vacía o 0)';
-        (porMoneda[k] = porMoneda[k] || []).push(r);
-      }
-      const monedas = Object.keys(porMoneda).sort((a, b) => porMoneda[b].length - porMoneda[a].length);
-      const param = params.marcas.find(p => p.clave === mc);
-      let moneda = monedas.find(m => m !== '(vacía o 0)') || (param && param.moneda) || '—';
-      if (monedas.length > 1) {
-        problemas.push({
-          nivel: 'error', marca: nombreMarca,
-          titulo: `${nombreMarca}: tiene ${monedas.length} valores distintos de "Moneda marca" en las BBDD`,
-          detalle: monedas.map(k => `${k}: ${porMoneda[k].length} filas` + (porMoneda[k].length <= 3
-            ? ` (${porMoneda[k].map(r => `${r.tipo === 'fact' ? CONFIG.hojas.facturacion : CONFIG.hojas.bo} fila ${r.fila}, total ${r.total}`).join('; ')})` : '')).join(' · '),
-        });
-      }
-
-      // Conversión de moneda: TC usados vs Parametros Moneda
-      const convertidos = regs.filter(r => r.convertido);
-      for (const r of convertidos) {
-        const par = params.pares[`${r.monedaOrig}>${r.monedaMarca}`];
-        if (!par || par.tc !== r.tc) {
-          r.tcDistinto = true;
-        }
-      }
-      const distintos = convertidos.filter(r => r.tcDistinto);
-      if (distintos.length) {
-        problemas.push({ nivel: 'aviso', marca: nombreMarca,
-          titulo: `${nombreMarca}: ${distintos.length} filas convertidas con TC distinto al de "${CONFIG.hojas.moneda}"`,
-          detalle: distintos.slice(0, 6).map(r => `fila ${r.fila}: ${r.monedaOrig}>${r.monedaMarca} TC ${r.tc}`).join(' · ') });
-      }
-
-      marcas.push({
-        hoja: nombre, nombre: nombreMarca, clave: mc, moneda, monedas,
-        bloques, tieneFiscal: bloques.length > 1,
-        convierte: convertidos.length > 0,
-        boTodas: nB.registros.filter(r => r.marcaClave === mc),
-        sinFilas: regs.length === 0,
-      });
-    });
-    if (!marcas.length) throw new ErrorCarga('No se encontraron hojas de marca visibles (A2 = "Item" y A6 = "Forecast").');
-    if (marcas.some(m => m.monedas.length <= 1)) {
-      const okM = marcas.filter(m => m.monedas.length <= 1).map(m => m.nombre);
-      problemas.push({ nivel: 'ok', titulo: `Moneda marca única en ambas BBDD: ${okM.join(', ')}` });
-    }
-    for (const m of marcas.filter(x => x.sinFilas)) problemas.push({ nivel: 'info', titulo: `${m.nombre}: no tiene filas en ninguna BBDD` });
-    if (ocultas.length) problemas.push({ nivel: 'info', titulo: `Hojas ocultas ignoradas (no se leen): ${ocultas.map(n => `"${n}"`).join(', ')}` });
-
-    const items = marcas.flatMap(m => m.bloques.flatMap(b => b.conc));
-    const resumen = {
-      comparaciones: items.length,
-      ok: items.filter(i => i.ok).length,
-      diferencias: items.filter(i => !i.ok).length,
-      errores: problemas.filter(p => p.nivel === 'error').length,
-      avisos: problemas.filter(p => p.nivel === 'aviso').length,
-    };
-
-    return {
-      fact: { nombre: tF.nombre, filas: tF.filas.length, corte: nF.corte, registros: nF.registros },
-      bo: { nombre: tB.nombre, filas: tB.filas.length, corte: nB.corte, registros: nB.registros },
-      parametros: params, corte, corteIdx, marcas, problemas, ocultas, resumen,
-    };
-  }
-
-  return { procesarLibro, ErrorCarga, MESES, MESES_CORTOS, LAYOUT, FILA, colLetra, refHoja, mesCorto, soloDia, idxMes };
+  return { MESES, MESES_CORTOS, LAYOUT, colLetra, refHoja, mesCorto, soloDia, fecha };
 })();
+
+/* ===================================================================== */
+/*  Datos                                                                */
+/* ===================================================================== */
+
+const Datos = (() => {
+  // Convierte el JSON al modelo que usa la interfaz (fechas como Date, filas de detalle por bloque).
+  function adaptar(j) {
+    const m = j.meta;
+    const filaF = r => ({ ...r, fecha: Util.fecha(r.fecha) });
+    const marcas = j.marcas.map(mc => {
+      const facturas = mc.detalle ? mc.detalle.facturas.map(filaF) : [];
+      const bo = mc.detalle ? mc.detalle.bo.map(filaF) : [];
+      const bloques = mc.bloques.map(b => {
+        if (b.calc) {
+          const periodo = new Set(b.meses.map(x => `${x.anio}|${x.mes}`));
+          const enPeriodo = r => periodo.has(`${r.anio}|${r.mes}`);
+          b.calc.filasF = facturas.filter(enPeriodo);
+          b.calc.filasB = bo.filter(enPeriodo);
+        }
+        return b;
+      });
+      return { ...mc, bloques, boTodas: bo };
+    });
+    return {
+      meta: m,
+      archivo: m.archivo,
+      generado: m.generado ? new Date(m.generado) : null,
+      incluirDetalle: !!m.incluirDetalle,
+      hojas: m.hojas,
+      tolerancia: m.tolerancia,
+      categorias: m.categorias,
+      sinCategoria: m.sinCategoria,
+      fact: { nombre: m.fact.hoja, filas: m.fact.filas, corte: Util.fecha(m.fact.corte) },
+      bo: { nombre: m.bo.hoja, filas: m.bo.filas, corte: Util.fecha(m.bo.corte) },
+      corte: Util.fecha(m.corte),
+      parametros: j.parametros,
+      problemas: j.problemas,
+      resumen: j.resumen,
+      ocultas: j.ocultas,
+      marcas,
+    };
+  }
+
+  async function cargar() {
+    let resp;
+    try {
+      resp = await fetch(CONFIG.archivoDatos, { cache: 'no-store' });
+    } catch (e) {
+      throw new Error(location.protocol === 'file:'
+        ? 'Abriste el panel como archivo local: el navegador no permite leer el JSON así. Usa un servidor local (python -m http.server -d docs) o la página publicada.'
+        : `No se pudo descargar ${CONFIG.archivoDatos} (${e.message}).`);
+    }
+    if (!resp.ok) throw new Error(`No se pudo descargar ${CONFIG.archivoDatos} (HTTP ${resp.status}). ¿Se corrió generar_datos.py y se hizo push?`);
+    return adaptar(await resp.json());
+  }
+
+  return { cargar, adaptar };
+})();
+
 
 /* ===================================================================== */
 /*  UI                                                                   */
@@ -489,7 +116,6 @@ const Engine = (() => {
 
 const UI = (() => {
   let modelo = null;
-  let nombreArchivo = '';
   const estado = {
     vista: 'resumen', marca: null, bloque: 0,
     soloForecast: false, orden: { k: 'ytd', dir: -1 },
@@ -512,7 +138,7 @@ const UI = (() => {
   const fmtTC = v => (v == null ? '—' : nfTC.format(v));
   const pad = n => String(n).padStart(2, '0');
   const fmtFecha = d => (d ? `${pad(d.getDate())}-${pad(d.getMonth() + 1)}-${d.getFullYear()}` : '—');
-  const mesLargo = (m) => `${Engine.MESES[m.mes]} ${m.anio}`;
+  const mesLargo = (m) => `${Util.MESES[m.mes]} ${m.anio}`;
 
   /* ---------- Semáforo ---------- */
   const ICONO = { verde: '✓', amarillo: '!', rojo: '✕', gris: '–' };
@@ -540,24 +166,23 @@ const UI = (() => {
   /* ---------- Textos de origen (tooltips) ---------- */
   function descPeriodo(b) {
     const ini = b.meses[0], fin = b.meses[11];
-    return b.tipo === 'calendario' ? `Año=${ini.anio}` : `${Engine.mesCorto(ini.anio, ini.mes)} a ${Engine.mesCorto(fin.anio, fin.mes)} (pares Año/Mes de las filas 1–2)`;
+    return b.tipo === 'calendario' ? `Año=${ini.anio}` : `${Util.mesCorto(ini.anio, ini.mes)} a ${Util.mesCorto(fin.anio, fin.mes)} (pares Año/Mes de las filas 1–2)`;
   }
   function refTotal(marca, b, fila) {
-    return `${Engine.refHoja(marca.hoja)}!${Engine.colLetra(b.c0 + Engine.LAYOUT.total)}${fila}`;
+    return `${Util.refHoja(marca.hoja)}!${Util.colLetra(b.c0 + Util.LAYOUT.total)}${fila}`;
   }
   function textoConversion(marca) {
     if (!marca.convierte) return '';
-    const pares = [...new Set(marca.bloques.flatMap(b => b.calc ? [...b.calc.filasF, ...b.calc.filasB] : [])
-      .concat(marca.boTodas).filter(r => r.convertido).map(r => `${r.monedaOrig}>${r.monedaMarca} × ${fmtTC(r.tc)}`))];
-    return `\nIncluye documentos convertidos a ${marca.moneda} (${pares.join(', ')}, TC de "${CONFIG.hojas.moneda}"). Ver recuadro "Conversión de moneda".`;
+    const pares = marca.paresConversion.map(p => `${p.orig}>${p.dest} × ${fmtTC(p.tc)}`);
+    return `\nIncluye documentos convertidos a ${marca.moneda} (${pares.join(', ')}, TC de "${modelo.hojas.moneda}"). Ver recuadro "Conversión de moneda".`;
   }
   function origen(marca, b, campo) {
     const p = descPeriodo(b);
     const conv = textoConversion(marca);
-    const T = Engine.colLetra(b.c0 + Engine.LAYOUT.total);
+    const T = Util.colLetra(b.c0 + Util.LAYOUT.total);
     switch (campo) {
-      case 'fact': return `Σ ${CONFIG.hojas.facturacion} col 'Total moneda marca' | Proveedor=${marca.nombre}, ${p} · equivale a ${refTotal(marca, b, 3)}${conv}`;
-      case 'bo': return `Σ ${CONFIG.hojas.bo} col 'Total moneda marca' | Marca=${marca.nombre}, Año OC y Mes de la fecha OC, ${p} · equivale a ${refTotal(marca, b, 4)}\nSolo OC del período: BO de OC de otros años no entra, igual que en el Excel. Filas con Cantidad pdte = 0 suman 0.${conv}`;
+      case 'fact': return `Σ ${modelo.hojas.facturacion} col 'Total moneda marca' | Proveedor=${marca.nombre}, ${p} · equivale a ${refTotal(marca, b, 3)}${conv}`;
+      case 'bo': return `Σ ${modelo.hojas.bo} col 'Total moneda marca' | Marca=${marca.nombre}, Año OC y Mes de la fecha OC, ${p} · equivale a ${refTotal(marca, b, 4)}\nSolo OC del período: BO de OC de otros años no entra, igual que en el Excel. Filas con Cantidad pdte = 0 suman 0.${conv}`;
       case 'factbo': return `Facturación + Backorder · equivale a ${refTotal(marca, b, 5)}${conv}`;
       case 'fc': return `Celda Total del Forecast (fila 6, input manual) · ${refTotal(marca, b, 6)}`;
       case 'cumpl': return `Fact+BO total / Forecast total · equivale a ${refTotal(marca, b, 7)} = IFERROR(${T}5/${T}6,0)\nCompara lo acumulado contra los 12 meses de forecast.`;
@@ -629,76 +254,33 @@ const UI = (() => {
     b.textContent = oscuro ? '☀' : '☾';
   }
 
-  /* ---------- Carga del archivo ---------- */
-  function initCarga() {
-    const zona = $('#zona');
-    const input = $('#archivo');
-    $('#btn-elegir').addEventListener('click', () => input.click());
-    zona.addEventListener('click', e => { if (e.target === zona) input.click(); });
-    zona.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); } });
-    input.addEventListener('change', () => { if (input.files[0]) cargar(input.files[0]); input.value = ''; });
-    ['dragenter', 'dragover'].forEach(ev => zona.addEventListener(ev, e => { e.preventDefault(); zona.classList.add('activa'); }));
-    ['dragleave', 'drop'].forEach(ev => zona.addEventListener(ev, e => { e.preventDefault(); zona.classList.remove('activa'); }));
-    zona.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) cargar(f); });
-    $('#btn-recargar').addEventListener('click', () => mostrarCarga());
-  }
-
-  function mostrarCarga() {
-    $('#carga').hidden = false;
-    $('#app').hidden = true;
-    $('#btn-recargar').hidden = true;
-    $('#tabs').hidden = true;
-    $('#estado-carga').textContent = '';
-    $('#estado-carga').className = 'estado-carga';
-  }
-
-  function cargar(file) {
+  /* ---------- Carga de datos (JSON precalculado) ---------- */
+  async function cargarDatos() {
     const st = $('#estado-carga');
-    if (!/\.(xlsx|xlsm|xls)$/i.test(file.name)) {
+    try {
+      modelo = await Datos.cargar();
+      estado.marca = modelo.marcas[0].hoja;
+      $('#carga').hidden = true;
+      $('#app').hidden = false;
+      $('#tabs').hidden = false;
+      renderMeta();
+      irA(estado.vista);
+    } catch (err) {
+      console.error(err);
       st.className = 'estado-carga error';
-      st.textContent = 'El archivo debe ser un Excel (.xlsx).';
-      return;
+      st.textContent = err.message;
     }
-    if (typeof XLSX === 'undefined') {
-      st.className = 'estado-carga error';
-      st.textContent = 'No se pudo cargar la librería SheetJS (requiere conexión para descargarla desde el CDN).';
-      return;
-    }
-    st.className = 'estado-carga';
-    st.textContent = `Procesando "${file.name}" en tu navegador…`;
-    const lector = new FileReader();
-    lector.onerror = () => { st.className = 'estado-carga error'; st.textContent = 'No se pudo leer el archivo.'; };
-    lector.onload = () => {
-      setTimeout(() => {
-        try {
-          const wb = XLSX.read(new Uint8Array(lector.result), { type: 'array', cellDates: true, cellStyles: false });
-          modelo = Engine.procesarLibro(wb);
-          nombreArchivo = file.name;
-          estado.marca = estado.marca && modelo.marcas.some(m => m.hoja === estado.marca) ? estado.marca : modelo.marcas[0].hoja;
-          estado.bloque = 0;
-          $('#carga').hidden = true;
-          $('#app').hidden = false;
-          $('#btn-recargar').hidden = false;
-          $('#tabs').hidden = false;
-          renderMeta();
-          irA(estado.vista);
-        } catch (err) {
-          console.error(err);
-          st.className = 'estado-carga error';
-          st.textContent = err instanceof Engine.ErrorCarga ? err.message : `Error al procesar el Excel: ${err.message}`;
-        }
-      }, 20);
-    };
-    lector.readAsArrayBuffer(file);
   }
 
   /* ---------- Cabecera de datos + banner ---------- */
   function renderMeta() {
     const m = modelo;
     $('#meta').innerHTML = `
-      <div class="meta-item"><span class="meta-k">Archivo</span><span class="meta-v">${esc(nombreArchivo)}</span></div>
+      <div class="meta-item"><span class="meta-k">Fuente</span><span class="meta-v">${esc(m.archivo)}</span></div>
+      <div class="meta-item"><span class="meta-k">Generado</span><span class="meta-v">${m.generado ? `${fmtFecha(m.generado)} ${pad(m.generado.getHours())}:${pad(m.generado.getMinutes())}` : '—'}</span></div>
       <div class="meta-item"><span class="meta-k">Facturación</span><span class="meta-v">hoja <code>"${esc(m.fact.nombre)}"</code> · ${nf0.format(m.fact.filas)} filas · corte <strong>${fmtFecha(m.fact.corte)}</strong></span></div>
-      <div class="meta-item"><span class="meta-k">Backorder</span><span class="meta-v">hoja <code>"${esc(m.bo.nombre)}"</code> · ${nf0.format(m.bo.filas)} filas · corte <strong>${fmtFecha(m.bo.corte)}</strong></span></div>`;
+      <div class="meta-item"><span class="meta-k">Backorder</span><span class="meta-v">hoja <code>"${esc(m.bo.nombre)}"</code> · ${nf0.format(m.bo.filas)} filas · corte <strong>${fmtFecha(m.bo.corte)}</strong></span></div>
+      <div class="meta-item"><span class="meta-k">Conciliación</span><span class="meta-v"><button type="button" class="link" data-ir="conciliacion">${m.resumen.diferencias ? `✕ ${nf0.format(m.resumen.diferencias)} diferencias` : `✔ ${nf0.format(m.resumen.ok)}/${nf0.format(m.resumen.comparaciones)} cuadran`}</button></span></div>`;
     const r = m.resumen;
     const banner = $('#banner');
     if (r.diferencias || r.errores) {
@@ -819,7 +401,7 @@ const UI = (() => {
       if (y == null) return -1;
       return dir * (x - y);
     });
-    const mesCorte = corte ? Engine.MESES[corte.getMonth()] : '';
+    const mesCorte = corte ? Util.MESES[corte.getMonth()] : '';
     const cols = [
       ['nombre', 'Marca', 'text'], ['moneda', 'Moneda', 'text'], ['fact', 'Facturación', 'num'], ['bo', 'BO abierto', 'num'],
       ['factbo', 'Fact + BO', 'num'], ['fc', 'Forecast anual', 'num'], ['cumpl', 'Cumpl. anual (Excel)', 'num'],
@@ -951,7 +533,7 @@ const UI = (() => {
 
     const y = c.ytd;
     const ytdTitulo = b.tipo === 'calendario'
-      ? `Cumplimiento YTD${y.hasta ? ` (${Engine.MESES_CORTOS[y.desde.mes].toLowerCase()}–${Engine.MESES_CORTOS[y.hasta.mes].toLowerCase()})` : ''}`
+      ? `Cumplimiento YTD${y.hasta ? ` (${Util.MESES_CORTOS[y.desde.mes].toLowerCase()}–${Util.MESES_CORTOS[y.hasta.mes].toLowerCase()})` : ''}`
       : `Cumplimiento acumulado${y.completo ? ' (período completo)' : ''}`;
     const kpi = (titulo, valorHtml, tip, extra = '') => `
       <div class="kpi"><div class="kpi-k">${esc(titulo)} ${info(tip)}</div><div class="kpi-v">${valorHtml}</div>${extra ? `<div class="kpi-x">${extra}</div>` : ''}</div>`;
@@ -963,7 +545,7 @@ const UI = (() => {
       <div class="encabezado-vista">
         <div>
           <h1>${esc(marca.nombre)} <span class="moneda-chip">${esc(mon)}</span></h1>
-          <p class="sub">${esc(b.titulo)} · hoja <code>"${esc(marca.hoja)}"</code>${b.tipo === 'fiscal' ? ` · columnas ${Engine.colLetra(b.c0)}–${Engine.colLetra(b.c0 + 17)}` : ''}${c.tieneForecast ? '' : ' · <strong>sin forecast</strong>: solo Facturación y BO'}</p>
+          <p class="sub">${esc(b.titulo)} · hoja <code>"${esc(marca.hoja)}"</code>${b.tipo === 'fiscal' ? ` · columnas ${Util.colLetra(b.c0)}–${Util.colLetra(b.c0 + 17)}` : ''}${c.tieneForecast ? '' : ' · <strong>sin forecast</strong>: solo Facturación y BO'}</p>
         </div>
       </div>
       <div class="kpis">
@@ -976,7 +558,7 @@ const UI = (() => {
           ${kpi(ytdTitulo, chip(y.cumpl), origen(marca, b, 'ytd'), `<span class="tag tag-app">calculada por la app</span>${y.hasta ? ` Fact+BO ${fmt(y.factbo)} / Fc ${fmt(y.fc)}` : ''}`)}
         ` : kpi('Forecast', '<span class="muted">sin forecast</span>', `Fila 6 vacía o en 0 (${refTotal(marca, b, 6)}). No se calcula cumplimiento: se muestra "—", nunca 0%.`)}
       </div>
-      ${renderConversion(marca, c)}
+      ${renderConversion(marca, b)}
       <div class="grid-2">
         <section class="panel panel-ancho">
           <div class="panel-h"><h2>Facturación + Backorder mensual${c.tieneForecast ? ' vs. Forecast' : ''}</h2>
@@ -989,11 +571,11 @@ const UI = (() => {
             <p class="nota">Fact+BO del trimestre / Forecast del trimestre (fila 7).${trimParcial ? ` ${trimParcial.nombre} es <strong>parcial</strong>: el corte (${fmtFecha(modelo.corte)}) es anterior al fin del trimestre.` : ''}</p></div>
           ${c.trims.some(t => t.cumpl != null) ? '<div class="chart-box" style="height:260px"><canvas id="ch-trim" aria-label="Gráfico de cumplimiento trimestral"></canvas></div>' : '<p class="vacio">Sin forecast: no hay cumplimiento trimestral.</p>'}
           <table class="tabla tabla-mini"><thead><tr><th>Trim.</th><th class="n">Fact+BO</th><th class="n">Forecast</th><th class="n">Cumpl.</th></tr></thead>
-          <tbody>${c.trims.map((t, q) => `<tr><td>${t.nombre}${t.estado === 'parcial' ? ' <span class="tag">parcial</span>' : t.estado === 'futuro' ? ' <span class="tag">futuro</span>' : ''}</td><td class="n">${fmt(t.factbo)}</td><td class="n">${t.fc > 0 ? fmt(t.fc) : '—'}</td><td class="n">${chip(t.cumpl, `Equivale a ${Engine.refHoja(marca.hoja)}!${Engine.colLetra(b.c0 + Engine.LAYOUT.trimestres[q])}7 = Fact+BO ${t.nombre} / Forecast ${t.nombre}`)}</td></tr>`).join('')}</tbody></table>
+          <tbody>${c.trims.map((t, q) => `<tr><td>${t.nombre}${t.estado === 'parcial' ? ' <span class="tag">parcial</span>' : t.estado === 'futuro' ? ' <span class="tag">futuro</span>' : ''}</td><td class="n">${fmt(t.factbo)}</td><td class="n">${t.fc > 0 ? fmt(t.fc) : '—'}</td><td class="n">${chip(t.cumpl, `Equivale a ${Util.refHoja(marca.hoja)}!${Util.colLetra(b.c0 + Util.LAYOUT.trimestres[q])}7 = Fact+BO ${t.nombre} / Forecast ${t.nombre}`)}</td></tr>`).join('')}</tbody></table>
         </section>
       </div>
       ${renderCategorias(marca, b, c)}
-      <section class="panel">
+      ${modelo.incluirDetalle ? `<section class="panel">
         <div class="panel-h panel-h-fila"><div><h2>Backorder abierto</h2><p class="nota">Líneas con Cantidad pdte &gt; 0. Antigüedad en días a la fecha de corte de BO (${fmtFecha(modelo.bo.corte)}).</p></div>
           <label class="check"><input type="checkbox" id="bo-fuera" ${estado.boFuera ? 'checked' : ''}> Incluir OC fuera del período</label></div>
         <div id="tabla-bo"></div>
@@ -1001,12 +583,14 @@ const UI = (() => {
       <section class="panel">
         <div class="panel-h"><h2>Facturas del período</h2><p class="nota">${esc(b.titulo)}. Monto = "Total moneda marca" (lo que suma la hoja).</p></div>
         <div id="tabla-fact"></div>
-      </section>`;
+      </section>` : '<p class="nota detalle-omitido">El detalle de BO abiertas y facturas no se publica (generar_datos.py con INCLUIR_DETALLE = False).</p>'}`;
 
     bindFicha(v);
-    $('#bo-fuera').addEventListener('change', e => { estado.boFuera = e.target.checked; renderTablaBO(marca, c); });
-    renderTablaBO(marca, c);
-    renderTablaFact(marca, c);
+    if (modelo.incluirDetalle) {
+      $('#bo-fuera').addEventListener('change', e => { estado.boFuera = e.target.checked; renderTablaBO(marca, c); });
+      renderTablaBO(marca, c);
+      renderTablaFact(marca, c);
+    }
     chartsFicha(marca, b, c);
   }
 
@@ -1022,54 +606,45 @@ const UI = (() => {
     </table></div><p class="nota">Montos en ${esc(mon)}.</p></details>`;
   }
 
-  function renderConversion(marca, c) {
+  function renderConversion(marca, b) {
     if (!marca.convierte) return '';
-    const grupo = (filas, etiqueta) => {
-      const g = {};
-      for (const r of filas) {
-        const k = r.monedaOrig || '(vacía)';
-        const e = g[k] || (g[k] = { moneda: k, n: 0, orig: 0, conv: 0, tcs: new Set(), convertido: r.convertido });
-        e.n++; e.orig += r.montoOrig; e.conv += r.total; e.tcs.add(r.tc);
-      }
-      return Object.values(g).map(e => ({ ...e, etiqueta }));
-    };
-    const filas = [...grupo(c.filasF, CONFIG.hojas.facturacion), ...grupo(c.filasB.filter(r => r.cantidad > 0 || r.total), CONFIG.hojas.bo)];
+    const filas = b.conversion.map(f => ({ ...f, etiqueta: f.base }));
     const hayEnPeriodo = filas.some(f => f.convertido);
     const pares = Object.entries(modelo.parametros.pares);
     return `<section class="panel panel-conv">
       <div class="panel-h"><h2><span aria-hidden="true">⇄</span> Conversión de moneda</h2>
-        <p class="nota">${esc(marca.nombre)} se reporta en <strong>${esc(marca.moneda)}</strong>. Los documentos en otra moneda se multiplican por el TC de la hoja "${esc(CONFIG.hojas.moneda)}" (columnas D:E). ${hayEnPeriodo ? '' : '<strong>En este período no hay documentos convertidos.</strong>'}</p></div>
+        <p class="nota">${esc(marca.nombre)} se reporta en <strong>${esc(marca.moneda)}</strong>. Los documentos en otra moneda se multiplican por el TC de la hoja "${esc(modelo.hojas.moneda)}" (columnas D:E). ${hayEnPeriodo ? '' : '<strong>En este período no hay documentos convertidos.</strong>'}</p></div>
       <div class="tabla-wrap"><table class="tabla tabla-mini">
         <thead><tr><th>Base</th><th>Moneda original</th><th class="n">Docs</th><th class="n">Monto original</th><th class="n">TC usado</th><th class="n">Monto convertido (${esc(marca.moneda)})</th></tr></thead>
-        <tbody>${filas.map(f => `<tr class="${f.convertido ? 'resaltar' : ''}"><td>${esc(f.etiqueta)}</td><td>${esc(f.moneda)}${f.convertido ? ` <span class="tag">→ ${esc(marca.moneda)}</span>` : ''}</td><td class="n">${f.n}</td><td class="n">${fmt(f.orig)}</td><td class="n">${[...f.tcs].map(fmtTC).join(' / ')}</td><td class="n">${fmt(f.conv)}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">Sin documentos en el período.</td></tr>'}</tbody>
+        <tbody>${filas.map(f => `<tr class="${f.convertido ? 'resaltar' : ''}"><td>${esc(f.etiqueta)}</td><td>${esc(f.moneda)}${f.convertido ? ` <span class="tag">→ ${esc(marca.moneda)}</span>` : ''}</td><td class="n">${f.n}</td><td class="n">${fmt(f.orig)}</td><td class="n">${f.tcs.map(fmtTC).join(' / ')}</td><td class="n">${fmt(f.conv)}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">Sin documentos en el período.</td></tr>'}</tbody>
       </table></div>
-      <p class="nota">Tipos de cambio en "${esc(CONFIG.hojas.moneda)}": ${pares.map(([p, x]) => `${esc(p)} = ${fmtTC(x.tc)} (${esc(x.celda)})`).join(' · ') || '—'}. En BO, el monto original es "Total Neto ME" = Precio × Cantidad pdte.</p>
+      <p class="nota">Tipos de cambio en "${esc(modelo.hojas.moneda)}": ${pares.map(([p, x]) => `${esc(p)} = ${fmtTC(x.tc)} (${esc(x.celda)})`).join(' · ') || '—'}. En BO, el monto original es "Total Neto ME" = Precio × Cantidad pdte.</p>
     </section>`;
   }
 
   function renderCategorias(marca, b, c) {
-    const cats = [...CONFIG.categorias, CONFIG.sinCategoria];
+    const cats = [...modelo.categorias, modelo.sinCategoria];
     const totF = c.total.fact, totB = c.total.bo;
     const max = Math.max(1, ...cats.map(k => Math.max(Math.abs(c.catF[k]), Math.abs(c.catB[k]))));
     const barra = (v_, clase) => `<span class="cat-bar"><span class="${clase}" style="width:${Math.abs(v_) / max * 100}%"></span></span>`;
     const raw = obj => Object.entries(obj).map(([k, v_]) => `${k}: ${fmt(v_)}`).join(' · ');
-    const T = Engine.colLetra(b.c0 + Engine.LAYOUT.total);
+    const T = Util.colLetra(b.c0 + Util.LAYOUT.total);
     const filaCat = (k, i) => {
-      const sin = k === CONFIG.sinCategoria;
-      const tipF = sin ? `Valores de "Categoria" fuera de las 4 estándar: ${raw(c.rawF) || 'ninguno'}.\nNo existe en la hoja (no suma en la fila 23).` : `Equivale a ${Engine.refHoja(marca.hoja)}!${T}${19 + i}`;
-      const tipB = sin ? `Valores de "Grupo" fuera de las 4 estándar: ${raw(c.rawB) || 'ninguno'}.\nNo existe en la hoja (no suma en la fila 15).` : `Equivale a ${Engine.refHoja(marca.hoja)}!${T}${11 + i}`;
+      const sin = k === modelo.sinCategoria;
+      const tipF = sin ? `Valores de "Categoria" fuera de las 4 estándar: ${raw(c.rawF) || 'ninguno'}.\nNo existe en la hoja (no suma en la fila 23).` : `Equivale a ${Util.refHoja(marca.hoja)}!${T}${19 + i}`;
+      const tipB = sin ? `Valores de "Grupo" fuera de las 4 estándar: ${raw(c.rawB) || 'ninguno'}.\nNo existe en la hoja (no suma en la fila 15).` : `Equivale a ${Util.refHoja(marca.hoja)}!${T}${11 + i}`;
       return `<tr class="${sin ? 'sin-cat' : ''}"><th scope="row">${esc(k)}</th>
         <td class="n" data-tip="${esc(tipF)}">${fmt(c.catF[k])}</td><td class="n muted">${totF ? fmtPct(c.catF[k] / totF) : '—'}</td><td class="bar-cel">${barra(c.catF[k], 'cb-f')}</td>
         <td class="n" data-tip="${esc(tipB)}">${fmt(c.catB[k])}</td><td class="n muted">${totB ? fmtPct(c.catB[k] / totB) : '—'}</td><td class="bar-cel">${barra(c.catB[k], 'cb-b')}</td></tr>`;
     };
-    const s4 = cat => CONFIG.categorias.reduce((s, k) => s + cat[k], 0);
+    const s4 = cat => modelo.categorias.reduce((s, k) => s + cat[k], 0);
     return `<section class="panel">
       <div class="panel-h"><h2>Desglose por categoría</h2><p class="nota">Facturación por "Categoria"; BO por "Grupo". Montos en ${esc(marca.moneda)}. % sobre el total de la fila 3 / 4 (como la columna S).</p></div>
       <div class="tabla-wrap"><table class="tabla tabla-cat">
         <thead><tr><th>Categoría</th><th class="n">Facturación</th><th class="n">%</th><th></th><th class="n">Backorder</th><th class="n">%</th><th></th></tr></thead>
         <tbody>${cats.map(filaCat).join('')}</tbody>
         <tfoot>
-          <tr><th scope="row">Total 4 categorías</th><td class="n" data-tip="${esc(`Equivale a ${Engine.refHoja(marca.hoja)}!${T}23`)}">${fmt(s4(c.catF))}</td><td></td><td></td><td class="n" data-tip="${esc(`Equivale a ${Engine.refHoja(marca.hoja)}!${T}15`)}">${fmt(s4(c.catB))}</td><td></td><td></td></tr>
+          <tr><th scope="row">Total 4 categorías</th><td class="n" data-tip="${esc(`Equivale a ${Util.refHoja(marca.hoja)}!${T}23`)}">${fmt(s4(c.catF))}</td><td></td><td></td><td class="n" data-tip="${esc(`Equivale a ${Util.refHoja(marca.hoja)}!${T}15`)}">${fmt(s4(c.catB))}</td><td></td><td></td></tr>
           <tr><th scope="row">Total general</th><td class="n">${fmt(totF)}</td><td></td><td></td><td class="n">${fmt(totB)}</td><td></td><td></td></tr>
         </tfoot>
       </table></div></section>`;
@@ -1204,10 +779,10 @@ const UI = (() => {
   const archivoSeguro = s => s.replace(/[^\p{L}\p{N}_-]+/gu, '_').replace(/^_|_$/g, '');
 
   function renderTablaBO(marca, c) {
-    const corte = modelo.bo.corte ? Engine.soloDia(modelo.bo.corte) : null;
+    const corte = modelo.bo.corte ? Util.soloDia(modelo.bo.corte) : null;
     const base = estado.boFuera ? marca.boTodas : c.filasB;
     const filas = base.filter(r => r.cantidad > 0);
-    const antig = r => (corte ? Math.round((corte - Engine.soloDia(r.fecha)) / 864e5) : null);
+    const antig = r => (corte ? Math.round((corte - Util.soloDia(r.fecha)) / 864e5) : null);
     tablaDatos($('#tabla-bo'), {
       titulo: 'backorder', csv: archivoSeguro(`BO_abiertas_${marca.nombre}`), filas,
       orden: { k: 'dias', dir: -1 },
@@ -1237,7 +812,7 @@ const UI = (() => {
         { k: 'folio', l: 'Folio', v: r => r.folio },
         { k: 'com', l: 'Comentarios', v: r => r.comentarios, clase: 'desc' },
         { k: 'oc', l: 'OC', v: r => r.oc },
-        { k: 'cat', l: 'Categoría', v: r => r.cat, f: r => esc(r.cat) + (r.cat === CONFIG.sinCategoria && r.catRaw ? ` <span class="muted">(${esc(r.catRaw)})</span>` : '') },
+        { k: 'cat', l: 'Categoría', v: r => r.cat, f: r => esc(r.cat) + (r.cat === modelo.sinCategoria && r.catRaw ? ` <span class="muted">(${esc(r.catRaw)})</span>` : '') },
         { k: 'mon', l: 'Moneda orig.', v: r => r.monedaOrig, f: r => esc(r.monedaOrig) + (r.convertido ? ' <span class="tag">conv.</span>' : '') },
         { k: 'orig', l: 'Monto orig.', tipo: 'num', v: r => r.montoOrig, f: r => fmt(r.montoOrig) },
         { k: 'tc', l: 'TC', tipo: 'num', v: r => r.tc, f: r => fmtTC(r.tc) },
@@ -1251,10 +826,10 @@ const UI = (() => {
     const v = $('#vista-conciliacion');
     const r = modelo.resumen;
     const icono = { ok: '✔', info: 'ℹ', aviso: '!', error: '✕' };
-    const valorCel = (x, tipo) => (x === null ? '<span class="muted">vacía</span>' : Number.isNaN(x) ? '<span class="error-txt">no numérica</span>' : tipo === 'pct' ? fmtPct(x) : fmt(x));
+    const valorCel = it => (it.excelNoNumerico ? '<span class="error-txt">no numérica</span>' : it.excelVacia ? '<span class="muted">vacía</span>' : it.tipo === 'pct' ? fmtPct(it.excel) : fmt(it.excel));
     const fmtDif = (it) => {
       if (it.ok) return '<span class="ok-txt">✔</span>';
-      if (!Number.isFinite(it.dif)) return '<span class="error-txt">✕ celda no numérica</span>';
+      if (it.dif == null || !Number.isFinite(it.dif)) return '<span class="error-txt">✕ celda no numérica</span>';
       return `<span class="error-txt">✕ ${it.tipo === 'pct' ? `${it.dif > 0 ? '+' : ''}${nf.format(it.dif * 100)} pp` : `${it.dif > 0 ? '+' : ''}${fmt(it.dif)}`}</span>`;
     };
     const bloquesHtml = modelo.marcas.map(m => {
@@ -1273,7 +848,7 @@ const UI = (() => {
             <tbody>${b.conc.filter(it => !estado.soloDif || !it.ok).map(it => `<tr class="${it.ok ? '' : 'fila-dif'}">
               <td data-l="Concepto">${esc(it.concepto)}${it.nota ? ` ${info(it.nota)}` : ''}</td>
               <td data-l="Celda"><code>${esc(it.celda)}</code></td>
-              <td data-l="Excel" class="n">${valorCel(it.excel, it.tipo)}</td>
+              <td data-l="Excel" class="n">${valorCel(it)}</td>
               <td data-l="App" class="n">${it.app == null ? '—' : it.tipo === 'pct' ? fmtPct(it.app) : fmt(it.app)}</td>
               <td data-l="Resultado" class="n">${fmtDif(it)}</td></tr>`).join('')}</tbody>
           </table></div>`).join('')}
@@ -1283,7 +858,7 @@ const UI = (() => {
     v.innerHTML = `
       <div class="encabezado-vista"><div>
         <h1>Conciliación</h1>
-        <p class="sub">Lo recalculado por la app desde las BBDD, contra los valores cacheados de cada hoja de marca visible. Tolerancia: ${fmt(CONFIG.tolerancia.monto)} en montos y ${nfTC.format(CONFIG.tolerancia.pct)} en % (${nf.format(CONFIG.tolerancia.pct * 100)} pp).</p>
+        <p class="sub">Resultado de generar_datos.py: lo recalculado desde las BBDD contra los valores cacheados de cada hoja de marca visible. Si algo no cuadra, el script no publica el JSON. Tolerancia: ${fmt(modelo.tolerancia.monto)} en montos y ${nfTC.format(modelo.tolerancia.pct)} en % (${nf.format(modelo.tolerancia.pct * 100)} pp).</p>
       </div></div>
       <div class="stats">
         <div class="stat"><span class="stat-v">${nf0.format(r.comparaciones)}</span><span class="stat-k">comparaciones</span></div>
@@ -1306,17 +881,17 @@ const UI = (() => {
     $$('[data-cfg]').forEach(el => {
       const k = el.dataset.cfg;
       el.textContent = k === 'verde' ? fmtPct(CONFIG.semaforo.verdeDesde) : k === 'amarillo' ? fmtPct(CONFIG.semaforo.amarilloDesde)
-        : k === 'tolMonto' ? fmt(CONFIG.tolerancia.monto) : k === 'tolPct' ? nfTC.format(CONFIG.tolerancia.pct) : '';
+        : k === 'tolMonto' ? fmt(modelo.tolerancia.monto) : k === 'tolPct' ? nfTC.format(modelo.tolerancia.pct) : '';
     });
     const pares = Object.entries(modelo.parametros.pares).map(([p, x]) => `${p} × ${fmtTC(x.tc)}`).join(' · ');
     const marcasMon = modelo.parametros.marcas.map(m => `${m.marca.trim()} → ${m.moneda}`).join(' · ');
-    $('#metodo-moneda').textContent = `Hoy en "${CONFIG.hojas.moneda}": ${marcasMon || '—'}. Pares: ${pares || '—'}.`;
+    $('#metodo-moneda').textContent = `Hoy en "${modelo.hojas.moneda}": ${marcasMon || '—'}. Pares: ${pares || '—'}.`;
   }
 
   function init() {
     initTema();
     initTooltips();
-    initCarga();
+    cargarDatos();
     initTabs();
   }
 
@@ -1324,7 +899,7 @@ const UI = (() => {
 })();
 
 /* Acceso: sin sesión iniciada en index.html se vuelve al login (barrera básica, ver README). */
-const SESION = { auth: 'gcp_auth', email: 'gcp_auth_email' };
+const SESION = { auth: 'cumpl_auth', email: 'cumpl_auth_email' };
 function sesionActiva() {
   try { return sessionStorage.getItem(SESION.auth) === 'true'; } catch (e) { return false; }
 }
@@ -1347,4 +922,3 @@ if (typeof document !== 'undefined') {
   });
 }
 
-if (typeof module !== 'undefined' && module.exports) module.exports = { CONFIG, Engine };

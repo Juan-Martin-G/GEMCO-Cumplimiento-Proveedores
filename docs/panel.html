@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- connect-src 'none': la página donde se carga el Excel no puede enviar datos a ningún servidor. -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self' file:; script-src 'self' file: https://cdnjs.cloudflare.com; style-src 'self' file: 'unsafe-inline'; img-src 'self' file: data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'">
+  <!-- connect-src 'self': el panel solo lee datos_cumplimiento.json de su propio sitio. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; form-action 'none'; base-uri 'none'; object-src 'none'">
   <meta name="referrer" content="no-referrer">
-  <meta name="description" content="Cumplimiento de proveedores GEMCO: carga el Excel y se procesa localmente en el navegador.">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="description" content="Panel de cumplimiento de proveedores GEMCO.">
   <title>Cumplimiento de proveedores · GEMCO</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="styles.css">
-  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" integrity="sha384-vtjasyidUo0kW94K5MXDXntzOJpQgBKXmE7e2Ga4LG0skTTLeBi97eFAXsqewJjw" crossorigin="anonymous"></script>
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD" crossorigin="anonymous"></script>
   <script src="app.js"></script>
 </head>
@@ -28,7 +28,6 @@
         <button type="button" role="tab" data-ir="metodo" aria-selected="false">Cómo se calcula</button>
       </nav>
       <div class="acciones">
-        <button type="button" id="btn-recargar" class="btn-sec" hidden>Cargar otro Excel</button>
         <button type="button" id="btn-tema" class="btn-icono" aria-label="Cambiar tema">☾</button>
         <button type="button" id="btn-salir" class="btn-sec" title="">Cerrar sesión</button>
       </div>
@@ -36,26 +35,9 @@
   </header>
 
   <main class="contenedor">
-    <!-- Pantalla de carga -->
+    <!-- Estado de carga del JSON -->
     <section id="carga" class="carga">
-      <h1>Cumplimiento de proveedores</h1>
-      <p class="sub">Arrastra el Excel consolidado o selecciónalo desde tu equipo.</p>
-      <div id="zona" class="zona" tabindex="0" role="button" aria-label="Seleccionar archivo Excel">
-        <div class="zona-icono" aria-hidden="true">⬆</div>
-        <p><strong>Arrastra aquí el archivo .xlsx</strong></p>
-        <p class="muted">o</p>
-        <button type="button" id="btn-elegir" class="btn">Seleccionar archivo</button>
-        <input type="file" id="archivo" accept=".xlsx,.xlsm,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden>
-      </div>
-      <p id="estado-carga" class="estado-carga" role="status" aria-live="polite"></p>
-      <div class="privacidad">
-        <span aria-hidden="true">🔒</span>
-        <div>
-          <strong>El archivo no sale de tu equipo.</strong>
-          Se lee y se calcula completamente en este navegador (SheetJS). La página no envía datos a ningún servidor
-          y no guarda el Excel: al cerrar o recargar la pestaña, los datos desaparecen.
-        </div>
-      </div>
+      <p id="estado-carga" class="estado-carga" role="status" aria-live="polite">Cargando datos…</p>
     </section>
 
     <!-- Aplicación -->
@@ -70,7 +52,7 @@
       <section id="vista-metodo" class="vista" hidden>
         <div class="encabezado-vista"><div>
           <h1>Cómo se calcula</h1>
-          <p class="sub">Cada métrica replica una fórmula del Excel, salvo el cumplimiento YTD, que es nuevo y lo calcula la app.</p>
+          <p class="sub">Cada métrica replica una fórmula del Excel, salvo el cumplimiento YTD, que es nuevo. Los cálculos los hace <code>generar_datos.py</code> a partir del Excel y el panel solo los muestra.</p>
         </div></div>
 
         <section class="panel">
@@ -124,7 +106,7 @@
   </main>
 
   <footer class="pie contenedor">
-    Los datos se procesan solo en este navegador · Formato numérico es-CL · Librerías: SheetJS y Chart.js (CDN)
+    Datos precalculados con generar_datos.py · Formato numérico es-CL · Gráficos: Chart.js
   </footer>
 
   <div id="tooltip" class="tooltip" role="tooltip" hidden></div>

@@ -159,21 +159,10 @@ button, input, select { font: inherit; color: inherit; }
 .link { background: none; border: 0; padding: 0; color: inherit; text-decoration: underline; cursor: pointer; font-weight: 700; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-/* ---------- Pantalla de carga ---------- */
+/* ---------- Carga de datos ---------- */
 .carga { max-width: 640px; margin: 48px auto; text-align: center; }
-.carga .sub { margin: 8px 0 24px; }
-.zona {
-  border: 2px dashed var(--line); border-radius: 16px; background: var(--surface);
-  padding: 40px 20px; cursor: pointer; transition: border-color .15s, background .15s;
-}
-.zona:hover, .zona.activa { border-color: var(--accent); background: var(--accent-soft); }
-.zona p { margin: 4px 0; }
-.zona .btn { margin-top: 6px; }
-.zona-icono { font-size: 2rem; color: var(--accent); margin-bottom: 6px; }
 .estado-carga { min-height: 1.5em; margin: 16px 0; font-weight: 550; }
 .estado-carga.error { color: var(--error); background: var(--st-rojo-bg); border-radius: 8px; padding: 10px 14px; text-align: left; }
-.privacidad { display: flex; gap: 12px; text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; font-size: 0.9rem; color: var(--ink-2); }
-.privacidad strong { color: var(--ink-1); display: block; }
 
 /* ---------- Cabecera de datos ---------- */
 .sub { color: var(--ink-2); margin-top: 4px; }
@@ -302,6 +291,7 @@ select { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; b
 .segmentado button[aria-pressed="true"] { background: var(--accent); color: var(--surface); }
 .panel-conv { border-color: var(--accent); }
 .filtros { margin: 8px 0 12px; }
+.detalle-omitido { padding: 12px 0 24px; }
 
 /* Conciliación */
 .conc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(540px, 1fr)); gap: 0 16px; }

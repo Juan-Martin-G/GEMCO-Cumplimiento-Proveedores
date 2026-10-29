@@ -27,8 +27,8 @@ const ACCESO = {
 
 // Claves propias de este sitio (EERR comparte el dominio github.io).
 const K = {
-  auth: 'gcp_auth', authEmail: 'gcp_auth_email',
-  email: 'gcp_pending_email', codigo: 'gcp_pending_code', vence: 'gcp_pending_exp',
+  auth: 'cumpl_auth', authEmail: 'cumpl_auth_email',
+  email: 'cumpl_pending_email', codigo: 'cumpl_pending_code', vence: 'cumpl_pending_exp',
 };
 
 const $ = id => document.getElementById(id);
