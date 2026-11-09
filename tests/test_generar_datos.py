@@ -435,6 +435,47 @@ def test_comparacion_bo_desaparece_sin_factura_es_revisar(tmp_path):
     assert mayo["items"][0]["causa"] == "BO que desaparece sin factura nueva que mencione la OC"
 
 
+def test_comparacion_linea_nueva_en_oc_reciente_es_esperable_y_en_oc_antigua_revisar(tmp_path):
+    # Corte de BO de la versión vieja: 05-05-2026.
+    bo_ant = BO_BASE + [_bo("0002/26", "P1", datetime(2026, 3, 1), 1, 10)]
+    bo_act = bo_ant + [
+        _bo("0001/26", "P2", datetime(2026, 5, 5), 1, 30),   # flete agregado a una OC de la misma semana
+        _bo("0002/26", "P2", datetime(2026, 3, 1), 1, 20),   # línea nueva en una OC de 65 días antes del corte
+    ]
+    cmp = _comparar(tmp_path, FACTURAS_BASE, bo_ant, FACTURAS_BASE, bo_act)
+    mayo = next(f for f in cmp["filas"] if (f["anio"], f["mes"]) == (2026, 4))
+    assert mayo["estado"] == "esperable"
+    assert mayo["items"][0]["causa"].startswith("Línea nueva o aumento en OC reciente")
+    marzo = next(f for f in cmp["filas"] if (f["anio"], f["mes"]) == (2026, 2))
+    assert marzo["estado"] == "revisar"
+    assert marzo["items"][0]["causa"] == "BO que sube en una OC antigua"
+
+
+def test_comparacion_probable_factura_sin_referencia_de_oc(tmp_path):
+    # El BO de 50 desaparece y llega una única factura nueva de 49,8 que no menciona ninguna OC.
+    bo_act = [_bo("0001/26", "P1", datetime(2026, 5, 5), 0, 25)]
+    fact_act = FACTURAS_BASE + [_fact(4, datetime(2026, 5, 20), 49.8, comentarios="Fact.proveedores - 0005P")]
+    cmp = _comparar(tmp_path, FACTURAS_BASE, BO_BASE, fact_act, bo_act)
+    mayo = next(f for f in cmp["filas"] if (f["anio"], f["mes"]) == (2026, 4))
+    item = next(i for i in mayo["items"] if i["tipo"] == "bo")
+    assert item["causa"] == "Probable factura sin referencia de OC"
+    assert item["clase"] == "esperable" and item["aviso"] is True
+    assert "probable folio 4" in item["doc"]
+    assert mayo["estado"] == "esperable" and mayo["aviso"] is True
+    resumen = gd.resumen_cambios_json(cmp)
+    assert "folio" not in json.dumps(resumen, ensure_ascii=False).lower()   # el folio no se publica
+
+
+def test_comparacion_dos_facturas_candidatas_sigue_en_revisar(tmp_path):
+    bo_act = [_bo("0001/26", "P1", datetime(2026, 5, 5), 0, 25)]
+    fact_act = FACTURAS_BASE + [_fact(4, datetime(2026, 5, 20), 50, comentarios="sin ref"),
+                                _fact(5, datetime(2026, 5, 21), 50.3, comentarios="sin ref")]
+    cmp = _comparar(tmp_path, FACTURAS_BASE, BO_BASE, fact_act, bo_act)
+    mayo = next(f for f in cmp["filas"] if (f["anio"], f["mes"]) == (2026, 4))
+    item = next(i for i in mayo["items"] if i["tipo"] == "bo")
+    assert item["clase"] == "revisar" and "2 facturas sin OC" in item["doc"]
+
+
 def test_comparacion_cambio_de_tipo_de_cambio(tmp_path):
     facturas = FACTURAS_BASE + [_fact(4, datetime(2026, 4, 1), 100, moneda="USD")]
     ant = gd.calcular(construir_libro(tmp_path / "20261026 a.xlsx", facturas, BO_BASE, pares={"USD>EUR": 0.9}))

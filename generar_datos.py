@@ -32,7 +32,7 @@ import json
 import math
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from itertools import repeat
 from pathlib import Path
 
@@ -90,6 +90,11 @@ SIN_CATEGORIA = "Sin categoría"
 
 TOLERANCIA_MONTO = 0.01
 TOLERANCIA_PCT = 0.0001
+
+# Reporte de cambios
+DIAS_OC_ANTIGUA = 30            # una OC es "antigua" si su fecha es > 30 días anterior al corte de BO de la versión vieja
+COINCIDENCIA_PCT = 0.01         # factura sin OC que coincide con un BO desaparecido: diferencia < 1 % …
+COINCIDENCIA_ABS = 1.0          # … o < 1 unidad de moneda
 
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
          "septiembre", "octubre", "noviembre", "diciembre"]
@@ -948,6 +953,14 @@ def comparar_versiones(ant: dict, act: dict) -> dict:
         for r in d["regs"]:
             for oc in ocs_mencionadas(r):
                 ocs_facturadas.setdefault((r["marca_clave"], oc), set()).add(r["folio"])
+    # Facturas nuevas que no mencionan ninguna OC (candidatas a explicar un BO desaparecido)
+    facturas_sin_oc: dict = {}
+    for d in folios_nuevos:
+        if any(ocs_mencionadas(r) for r in d["regs"]):
+            continue
+        r0 = d["regs"][0]
+        facturas_sin_oc.setdefault(r0["marca_clave"], []).append(
+            {"folio": r0["folio"], "total": sum(r["total"] for r in d["regs"]), "comentarios": r0["comentarios"]})
 
     marcas_act = {m["clave"]: m for m in act["marcas"]}
     marcas_ant = {m["clave"]: m for m in ant["marcas"]}
@@ -978,12 +991,13 @@ def comparar_versiones(ant: dict, act: dict) -> dict:
                         continue
                     explicado += tn - ta
                     fila["items"].append(_clasificar(tipo, k, d_ant.get(k), d_act.get(k), ea, en, ta, tn,
-                                                     corte_f_ant, corte_b_ant, ocs_bo_ant, ocs_facturadas))
+                                                     corte_f_ant, corte_b_ant, ocs_bo_ant, ocs_facturadas, facturas_sin_oc))
                 fila[tipo]["explicado"] = abs(explicado - fila[tipo]["dif"]) <= 0.005
             fila["factbo"] = {k: fila["fact"][k] + fila["bo"][k] for k in ("ant", "act", "dif")}
             if not fila["items"]:
                 continue
             fila["estado"] = "revisar" if any(i["clase"] == "revisar" for i in fila["items"]) else "esperable"
+            fila["aviso"] = any(i.get("aviso") for i in fila["items"])
             filas.append(fila)
 
         # Cumplimientos y forecast por bloque
@@ -1042,7 +1056,8 @@ def comparar_versiones(ant: dict, act: dict) -> dict:
     }
 
 
-def _clasificar(tipo, k, doc_ant, doc_act, ea, en, ta, tn, corte_f_ant, corte_b_ant, ocs_bo_ant, ocs_facturadas) -> dict:
+def _clasificar(tipo, k, doc_ant, doc_act, ea, en, ta, tn, corte_f_ant, corte_b_ant, ocs_bo_ant, ocs_facturadas,
+                facturas_sin_oc=None) -> dict:
     """Clasifica la contribución de un documento a la diferencia de un mes."""
     dif = tn - ta
     doc = doc_act or doc_ant
@@ -1070,11 +1085,32 @@ def _clasificar(tipo, k, doc_ant, doc_act, ea, en, ta, tn, corte_f_ant, corte_b_
         if facturas:
             return {"tipo": tipo, "clase": "esperable", "causa": "BO recibido/facturado (factura nueva que menciona la OC)",
                     "doc": texto + f' · facturas {", ".join(facturas)}', "ant": ta, "act": tn, "dif": dif, **cant}
+        # ¿Una única factura nueva de la marca, sin OC en Comentarios, por el mismo monto?
+        monto = -dif
+        candidatas = [f for f in (facturas_sin_oc or {}).get(k[0], [])
+                      if abs(f["total"] - monto) < max(COINCIDENCIA_PCT * monto, COINCIDENCIA_ABS)]
+        if len(candidatas) == 1:
+            f = candidatas[0]
+            return {"tipo": tipo, "clase": "esperable", "aviso": True, "causa": "Probable factura sin referencia de OC",
+                    "doc": texto + f' · probable folio {f["folio"]} ({fmt_monto(f["total"])}, "{f["comentarios"]}")',
+                    "ant": ta, "act": tn, "dif": dif, **cant}
         causa = "BO que desaparece sin factura nueva que mencione la OC" if not en or en["total"] == 0 else "BO que baja sin factura nueva que mencione la OC"
+        if len(candidatas) > 1:
+            texto += f' · {len(candidatas)} facturas sin OC con monto similar: {", ".join(f["folio"] for f in candidatas)}'
         return {"tipo": tipo, "clase": "revisar", "causa": causa, "doc": texto, "ant": ta, "act": tn, "dif": dif, **cant}
     if doc_ant is None and (k[0], k[1]) not in ocs_bo_ant:
         return {"tipo": tipo, "clase": "esperable", "causa": "OC nueva", "doc": texto, "ant": ta, "act": tn, "dif": dif, **cant}
-    return {"tipo": tipo, "clase": "revisar", "causa": "BO que sube en una OC antigua", "doc": texto, "ant": ta, "act": tn, "dif": dif, **cant}
+    fecha_oc = min(r["fecha"] for r in doc["regs"])
+    if corte_b_ant is not None and (corte_b_ant.date() - fecha_oc.date()) > timedelta(days=DIAS_OC_ANTIGUA):
+        return {"tipo": tipo, "clase": "revisar", "causa": "BO que sube en una OC antigua", "doc": texto, "ant": ta, "act": tn, "dif": dif, **cant}
+    return {"tipo": tipo, "clase": "esperable", "causa": f"Línea nueva o aumento en OC reciente (≤ {DIAS_OC_ANTIGUA} días antes del corte anterior)",
+            "doc": texto, "ant": ta, "act": tn, "dif": dif, **cant}
+
+
+def _estado_md(f) -> str:
+    if f["estado"] == "revisar":
+        return "⚠ REVISAR"
+    return "✔ esperable (ⓘ con aviso)" if f.get("aviso") else "✔ esperable"
 
 
 def reporte_markdown(cmp: dict) -> str:
@@ -1082,7 +1118,8 @@ def reporte_markdown(cmp: dict) -> str:
     L = [f'# Cambios {a["fecha"]:%Y-%m-%d} → {n["fecha"]:%Y-%m-%d}', "",
          f'- Versión anterior: `{a["archivo"]}` · corte facturación {a["corteFact"]:%Y-%m-%d} · corte BO {a["corteBO"]:%Y-%m-%d}',
          f'- Versión actual: `{n["archivo"]}` · corte facturación {n["corteFact"]:%Y-%m-%d} · corte BO {n["corteBO"]:%Y-%m-%d}',
-         "- Montos en la moneda de reporte de cada marca. ESPERABLE = movimiento normal; REVISAR = requiere explicación.", ""]
+         "- Montos en la moneda de reporte de cada marca. ESPERABLE = movimiento normal; REVISAR = requiere explicación; "
+         "ⓘ aviso = esperable, pero conviene confirmarlo.", ""]
     revisar = [f for f in cmp["filas"] if f["estado"] == "revisar"]
     L += [f'**{len(cmp["filas"])} meses con cambios** ({len(revisar)} a revisar) · '
           f'{len(cmp["cumplimientos"])} cumplimientos que cambian · {len(cmp["forecast"])} cambios de forecast · '
@@ -1090,10 +1127,10 @@ def reporte_markdown(cmp: dict) -> str:
     L += ["## Resumen por marca y mes", "", "| Marca | Mes | Δ Facturación | Δ BO | Δ Fact+BO | Estado |", "|---|---|---:|---:|---:|---|"]
     for f in cmp["filas"]:
         L.append(f'| {f["marca"]} ({f["moneda"]}) | {f["etiqueta"]} | {fmt_monto(f["fact"]["dif"])} | {fmt_monto(f["bo"]["dif"])} | '
-                 f'{fmt_monto(f["factbo"]["dif"])} | {"⚠ REVISAR" if f["estado"] == "revisar" else "✔ esperable"} |')
+                 f'{fmt_monto(f["factbo"]["dif"])} | {_estado_md(f)} |')
     L += ["", "## Detalle por marca y mes", ""]
     for f in cmp["filas"]:
-        L.append(f'### {f["marca"]} · {f["etiqueta"]} — {"⚠ REVISAR" if f["estado"] == "revisar" else "✔ esperable"}')
+        L.append(f'### {f["marca"]} · {f["etiqueta"]} — {_estado_md(f)}')
         L.append("")
         for tipo, nombre in (("fact", "Facturación"), ("bo", "Backorder")):
             v = f[tipo]
@@ -1112,7 +1149,8 @@ def reporte_markdown(cmp: dict) -> str:
                     extra = f' · cant. {fmt_monto(i["cantAnt"])} → {fmt_monto(i["cantAct"])}'
                 if "tcAnt" in i:
                     extra = f' · TC {i["tcAnt"]} → {i["tcAct"]}'
-                L.append(f'| {"⚠ revisar" if i["clase"] == "revisar" else "esperable"} | {i["causa"]} | {i["doc"]}{extra} | '
+                clase = "⚠ revisar" if i["clase"] == "revisar" else ("esperable (ⓘ aviso)" if i.get("aviso") else "esperable")
+                L.append(f'| {clase} | {i["causa"]} | {i["doc"]}{extra} | '
                          f'{fmt_monto(i["ant"])} | {fmt_monto(i["act"])} | {fmt_monto(i["dif"])} |')
             L.append("")
     L += ["## Cumplimientos que cambian", ""]
@@ -1144,11 +1182,11 @@ def resumen_cambios_json(cmp: dict) -> dict:
         causas: dict = {}
         for i in f["items"]:
             k = (i["clase"], i["causa"], i["tipo"])
-            e = causas.setdefault(k, {"clase": i["clase"], "causa": i["causa"], "tipo": i["tipo"], "n": 0, "monto": 0.0})
+            e = causas.setdefault(k, {"clase": i["clase"], "aviso": bool(i.get("aviso")), "causa": i["causa"], "tipo": i["tipo"], "n": 0, "monto": 0.0})
             e["n"] += 1
             e["monto"] += i["dif"]
         filas.append({"marca": f["marca"], "moneda": f["moneda"], "anio": f["anio"], "mes": f["mes"], "etiqueta": f["etiqueta"],
-                      "fact": f["fact"], "bo": f["bo"], "factbo": f["factbo"], "estado": f["estado"],
+                      "fact": f["fact"], "bo": f["bo"], "factbo": f["factbo"], "estado": f["estado"], "aviso": f["aviso"],
                       "explicado": f["fact"]["explicado"] and f["bo"]["explicado"],
                       "causas": sorted(causas.values(), key=lambda c: (c["clase"] != "revisar", -abs(c["monto"])))})
     return {

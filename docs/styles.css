@@ -390,3 +390,5 @@ p.problema { margin: 0 0 8px; display: block; }
   .tabla-cambios td::before { content: attr(data-l); color: var(--ink-3); font-size: 0.78rem; font-weight: 600; text-align: left; }
   .tabla-cambios td.causas { display: block; text-align: left; }
 }
+.causa-aviso span:first-child { color: var(--st-amarillo-ink); font-weight: 600; }
+.tag-aviso { background: var(--st-amarillo-bg); color: var(--st-amarillo-ink); border-color: transparent; }

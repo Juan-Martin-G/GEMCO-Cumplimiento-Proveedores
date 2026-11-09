@@ -919,8 +919,8 @@ const UI = (() => {
             <td data-l="Δ Facturación" class="n" data-tip="${esc(`${fmt(f.fact.ant)} → ${fmt(f.fact.act)}`)}">${dif(f.fact.dif)}</td>
             <td data-l="Δ BO" class="n" data-tip="${esc(`${fmt(f.bo.ant)} → ${fmt(f.bo.act)}`)}">${dif(f.bo.dif)}</td>
             <td data-l="Δ Fact+BO" class="n">${dif(f.factbo.dif)}</td>
-            <td data-l="Estado">${estadoChip(f.estado)}${f.explicado ? '' : ' <span class="tag">sin explicar</span>'}</td>
-            <td data-l="Causas" class="causas">${f.causas.map(k => `<div class="causa causa-${k.clase}"><span>${k.clase === 'revisar' ? '⚠ ' : ''}${esc(k.causa)}${k.n > 1 ? ` (${k.n})` : ''}</span> ${dif(k.monto)}</div>`).join('')}</td>
+            <td data-l="Estado">${estadoChip(f.estado)}${f.aviso ? ' <span class="tag tag-aviso" data-tip="Esperable, pero conviene confirmarlo (por ejemplo, una factura sin referencia de OC que coincide en monto con un BO desaparecido).">con aviso</span>' : ''}${f.explicado ? '' : ' <span class="tag">sin explicar</span>'}</td>
+            <td data-l="Causas" class="causas">${f.causas.map(k => `<div class="causa causa-${k.clase}${k.aviso ? ' causa-aviso' : ''}"><span>${k.clase === 'revisar' ? '⚠ ' : k.aviso ? 'ⓘ ' : ''}${esc(k.causa)}${k.n > 1 ? ` (${k.n})` : ''}</span> ${dif(k.monto)}</div>`).join('')}</td>
           </tr>`).join('')}</tbody>
         </table></div></section>`).join('') || '<p class="vacio">No hay meses con cambios para mostrar.</p>'}
       <div class="grid-2 grid-texto">
