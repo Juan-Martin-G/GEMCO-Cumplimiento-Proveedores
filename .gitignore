@@ -12,6 +12,9 @@ data/raw/**
 Old/
 ~$*
 
+# Reportes de cambios entre versiones (contienen OC, folios y productos)
+reportes/
+
 # Python
 __pycache__/
 *.pyc

@@ -76,7 +76,9 @@ const Datos = (() => {
     return {
       meta: m,
       archivo: m.archivo,
+      fechaArchivo: m.fechaArchivo,
       generado: m.generado ? new Date(m.generado) : null,
+      cambios: j.cambios,
       incluirDetalle: !!m.incluirDetalle,
       hojas: m.hojas,
       tolerancia: m.tolerancia,
@@ -119,7 +121,7 @@ const UI = (() => {
   const estado = {
     vista: 'resumen', marca: null, bloque: 0,
     soloForecast: false, orden: { k: 'ytd', dir: -1 },
-    soloDif: false, boFuera: false,
+    soloDif: false, boFuera: false, soloRevisar: false,
   };
   const charts = {};
 
@@ -276,7 +278,7 @@ const UI = (() => {
   function renderMeta() {
     const m = modelo;
     $('#meta').innerHTML = `
-      <div class="meta-item"><span class="meta-k">Fuente</span><span class="meta-v">${esc(m.archivo)}</span></div>
+      <div class="meta-item meta-datos"><span class="meta-v"><strong>Datos al ${esc(m.fechaArchivo || '—')}</strong> (archivo: ${esc(m.archivo)})</span></div>
       <div class="meta-item"><span class="meta-k">Generado</span><span class="meta-v">${m.generado ? `${fmtFecha(m.generado)} ${pad(m.generado.getHours())}:${pad(m.generado.getMinutes())}` : '—'}</span></div>
       <div class="meta-item"><span class="meta-k">Facturación</span><span class="meta-v">hoja <code>"${esc(m.fact.nombre)}"</code> · ${nf0.format(m.fact.filas)} filas · corte <strong>${fmtFecha(m.fact.corte)}</strong></span></div>
       <div class="meta-item"><span class="meta-k">Backorder</span><span class="meta-v">hoja <code>"${esc(m.bo.nombre)}"</code> · ${nf0.format(m.bo.filas)} filas · corte <strong>${fmtFecha(m.bo.corte)}</strong></span></div>
@@ -316,7 +318,7 @@ const UI = (() => {
       Chart.defaults.color = css('--ink-2');
       Chart.defaults.borderColor = css('--grid');
     }
-    ({ resumen: renderResumen, ficha: renderFicha, conciliacion: renderConciliacion, metodo: renderMetodo })[estado.vista]();
+    ({ resumen: renderResumen, ficha: renderFicha, conciliacion: renderConciliacion, cambios: renderCambios, metodo: renderMetodo })[estado.vista]();
   }
 
   /* ---------- Plugins Chart.js propios ---------- */
@@ -877,6 +879,66 @@ const UI = (() => {
   }
 
   /* ---------- Vista Cómo se calcula ---------- */
+  /* ---------- Vista Cambios vs versión anterior ---------- */
+  function renderCambios() {
+    const v = $('#vista-cambios');
+    const c = modelo.cambios;
+    if (!c) {
+      v.innerHTML = `<div class="encabezado-vista"><div><h1>Cambios vs versión anterior</h1>
+        <p class="sub">No hay una versión anterior en data/raw/old/ para comparar.</p></div></div>`;
+      return;
+    }
+    const estadoChip = e => (e === 'revisar'
+      ? '<span class="chip chip-rojo"><span aria-hidden="true">!</span>Revisar</span>'
+      : '<span class="chip chip-verde"><span aria-hidden="true">✓</span>Esperable</span>');
+    const dif = x => `<span class="${x > 0 ? 'dif-pos' : x < 0 ? 'dif-neg' : 'muted'}">${x > 0 ? '+' : ''}${fmt(x)}</span>`;
+    const pctTxt = x => (x == null ? '—' : fmtPct(x));
+    const filas = c.filas.filter(f => !estado.soloRevisar || f.estado === 'revisar');
+    const nRev = c.filas.filter(f => f.estado === 'revisar').length;
+    const porMarca = {};
+    filas.forEach(f => { (porMarca[f.marca] = porMarca[f.marca] || []).push(f); });
+    v.innerHTML = `
+      <div class="encabezado-vista"><div>
+        <h1>Cambios vs versión anterior</h1>
+        <p class="sub">${esc(c.anterior.fecha)} → ${esc(c.actual.fecha)}. Por marca y mes, en la moneda de cada marca. El detalle de documentos (folios, OC y productos) está en <code>reportes/cambios_…md</code> y no se publica.</p>
+      </div></div>
+      <div class="stats">
+        <div class="stat"><span class="stat-v">${nf0.format(c.filas.length)}</span><span class="stat-k">meses con cambios</span></div>
+        <div class="stat"><span class="stat-v ${nRev ? 'error-txt' : 'ok-txt'}">${nf0.format(nRev)}</span><span class="stat-k">a revisar</span></div>
+        <div class="stat"><span class="stat-v">${nf0.format(c.cumplimientos.length)}</span><span class="stat-k">cumplimientos que cambian</span></div>
+        <div class="stat"><span class="stat-v">${nf0.format(c.forecast.length)}</span><span class="stat-k">cambios de forecast</span></div>
+        <div class="stat"><span class="stat-v">${nf0.format(c.parametros.length + c.nCategorias)}</span><span class="stat-k">cambios de parámetros / categorías</span></div>
+      </div>
+      <div class="panel-h-fila filtros"><label class="check"><input type="checkbox" id="solo-revisar" ${estado.soloRevisar ? 'checked' : ''}> Mostrar solo lo que hay que revisar</label></div>
+      ${Object.entries(porMarca).map(([marca, fs]) => `<section class="panel">
+        <div class="panel-h"><h2>${esc(marca)} <span class="muted">· ${esc(fs[0].moneda)}</span></h2></div>
+        <div class="tabla-wrap"><table class="tabla tabla-cambios">
+          <thead><tr><th>Mes</th><th class="n">Δ Facturación</th><th class="n">Δ BO</th><th class="n">Δ Fact+BO</th><th>Estado</th><th>Causas</th></tr></thead>
+          <tbody>${fs.map(f => `<tr>
+            <td data-l="Mes">${esc(f.etiqueta)}</td>
+            <td data-l="Δ Facturación" class="n" data-tip="${esc(`${fmt(f.fact.ant)} → ${fmt(f.fact.act)}`)}">${dif(f.fact.dif)}</td>
+            <td data-l="Δ BO" class="n" data-tip="${esc(`${fmt(f.bo.ant)} → ${fmt(f.bo.act)}`)}">${dif(f.bo.dif)}</td>
+            <td data-l="Δ Fact+BO" class="n">${dif(f.factbo.dif)}</td>
+            <td data-l="Estado">${estadoChip(f.estado)}${f.explicado ? '' : ' <span class="tag">sin explicar</span>'}</td>
+            <td data-l="Causas" class="causas">${f.causas.map(k => `<div class="causa causa-${k.clase}"><span>${k.clase === 'revisar' ? '⚠ ' : ''}${esc(k.causa)}${k.n > 1 ? ` (${k.n})` : ''}</span> ${dif(k.monto)}</div>`).join('')}</td>
+          </tr>`).join('')}</tbody>
+        </table></div></section>`).join('') || '<p class="vacio">No hay meses con cambios para mostrar.</p>'}
+      <div class="grid-2 grid-texto">
+        <section class="panel"><h2>Cumplimientos que cambian</h2>
+          ${c.cumplimientos.length ? `<div class="tabla-wrap"><table class="tabla tabla-mini"><thead><tr><th>Marca</th><th>Bloque</th><th>Período</th><th class="n">Antes</th><th class="n">Ahora</th></tr></thead>
+          <tbody>${c.cumplimientos.map(x => `<tr><td>${esc(x.marca)}</td><td>${esc(x.bloque)}</td><td>${esc(x.nombre)}</td><td class="n">${pctTxt(x.ant)}</td><td class="n">${chip(x.act)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted">Sin cambios.</p>'}
+        </section>
+        <section class="panel"><h2>Forecast, parámetros y categorías</h2>
+          <p><strong>Forecast:</strong> ${c.forecast.length ? '' : 'sin cambios.'}</p>
+          ${c.forecast.length ? `<ul class="lista-cambios">${c.forecast.map(x => `<li>⚠ ${esc(x.marca)} · ${esc(x.bloque)} · ${esc(x.periodo)}: ${fmt(x.ant)} → ${fmt(x.act)}</li>`).join('')}</ul>` : ''}
+          <p><strong>Parametros Moneda:</strong> ${c.parametros.length ? '' : 'sin cambios.'}</p>
+          ${c.parametros.length ? `<ul class="lista-cambios">${c.parametros.map(x => `<li>⚠ ${esc(x)}</li>`).join('')}</ul><p class="nota">Un cambio de tipo de cambio o una marca nueva en Parametros Moneda cambia montos sin que cambien los documentos.</p>` : ''}
+          <p><strong>Categorías:</strong> ${c.nCategorias ? `⚠ ${nf0.format(c.nCategorias)} documentos cambiaron de categoría (detalle en el reporte).` : 'sin cambios.'}</p>
+        </section>
+      </div>`;
+    $('#solo-revisar').addEventListener('change', e => { estado.soloRevisar = e.target.checked; renderCambios(); });
+  }
+
   function renderMetodo() {
     $$('[data-cfg]').forEach(el => {
       const k = el.dataset.cfg;

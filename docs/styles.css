@@ -373,3 +373,20 @@ p.problema { margin: 0 0 8px; display: block; }
 .login-msg { font-size: 0.85rem; border-radius: 8px; padding: 8px 10px; margin: 12px 0 0; }
 .login-msg.err { background: var(--st-rojo-bg); color: var(--st-rojo-ink); }
 .login-msg.ok { background: var(--st-verde-bg); color: var(--st-verde-ink); }
+
+/* ---------- Cambios vs versión anterior ---------- */
+.meta-datos { flex-basis: 100%; font-size: 0.95rem; }
+.dif-pos { color: var(--ok); font-variant-numeric: tabular-nums; }
+.dif-neg { color: var(--error); font-variant-numeric: tabular-nums; }
+.tabla-cambios td.causas { min-width: 260px; }
+.causa { display: flex; justify-content: space-between; gap: 12px; font-size: 0.84rem; padding: 1px 0; }
+.causa-revisar span:first-child { color: var(--st-rojo-ink); font-weight: 600; }
+.lista-cambios { margin: 0 0 10px; padding-left: 18px; font-size: 0.88rem; color: var(--ink-2); }
+@media (max-width: 720px) {
+  .tabla-cambios thead { display: none; }
+  .tabla-cambios, .tabla-cambios tbody, .tabla-cambios tr, .tabla-cambios td { display: block; width: 100%; }
+  .tabla-cambios tr { border: 1px solid var(--grid); border-radius: 10px; margin-bottom: 10px; padding: 6px 4px; }
+  .tabla-cambios td { display: flex; justify-content: space-between; gap: 12px; border: 0; padding: 4px 8px; text-align: right; }
+  .tabla-cambios td::before { content: attr(data-l); color: var(--ink-3); font-size: 0.78rem; font-weight: 600; text-align: left; }
+  .tabla-cambios td.causas { display: block; text-align: left; }
+}

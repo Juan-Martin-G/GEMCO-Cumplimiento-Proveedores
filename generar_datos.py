@@ -7,22 +7,33 @@ guarda en docs/datos_cumplimiento.json, que consume el panel estático
 
 USO (cada vez que se actualiza el Excel):
 
-    python generar_datos.py                      # usa el .xlsx más reciente de data/raw/
-    python generar_datos.py "data/raw/archivo.xlsx"
+    python generar_datos.py
+    python generar_datos.py --permitir-sin-categoria
 
-Lee los valores CACHEADOS del Excel (openpyxl data_only=True): el archivo debe
-estar guardado desde Excel con las fórmulas calculadas.
+El archivo fuente es el .xlsx de data/raw/ (no recursivo) cuyo nombre empieza con
+la fecha AAAAMMDD más reciente. La versión anterior, para el reporte de cambios,
+es la de fecha más reciente en data/raw/old/ que sea anterior a la actual.
 
-Antes de escribir el JSON concilia lo recalculado contra los valores de cada
-hoja de marca visible. Si algo no cuadra, termina con error y NO escribe el JSON.
+Pasos:
+  1. Recalcula en Python cada fila de "BBDD Facturacion" y "BBDD BO abiertas"
+     desde los datos crudos (marca, año, mes, categoría, moneda marca, TC y total)
+     y lo compara contra el valor cacheado de cada columna con fórmula.
+  2. Valida categorías, monedas y tipos de cambio de las marcas con hoja visible.
+  3. Calcula el cumplimiento y lo concilia contra las hojas de marca visibles.
+  4. Compara contra la versión anterior y escribe reportes/cambios_<ant>_a_<act>.md.
+
+Si algo no cuadra, termina con error y NO escribe el JSON.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
+import re
 import sys
 from datetime import date, datetime
+from itertools import repeat
 from pathlib import Path
 
 import openpyxl
@@ -38,24 +49,41 @@ from openpyxl.utils.datetime import from_excel
 INCLUIR_DETALLE = True
 
 CARPETA_EXCEL = Path("data/raw")
+NOMBRE_CARPETA_ANTERIORES = "old"           # data/raw/old/ (sin distinguir mayúsculas)
+CARPETA_REPORTES = Path("reportes")
 SALIDA_JSON = Path("docs/datos_cumplimiento.json")
+PATRON_ARCHIVO = re.compile(r"^(\d{8}).*\.xlsx$")
 
 # Nombres EXACTOS (sin trim). Ojo: existe una hoja oculta "BBDD Facturacion "
 # (con espacio final), base antigua de 2025, que NO debe leerse nunca.
 HOJA_FACTURACION = "BBDD Facturacion"
 HOJA_BO = "BBDD BO abiertas"
 HOJA_MONEDA = "Parametros Moneda"
+HOJA_PROVEEDOR = "Parametros Proveedor"
+HOJA_DICCIONARIO = "Diccionario Categorias"
 
-ENCABEZADOS_FACTURACION = [
-    "Proveedor", "Fecha de contabilización", "Año", "Mes", "Número de folio", "Comentarios",
-    "Orden de compra", "Categoria", "Moneda del documento", "Total documento (ME)", "Moneda marca",
-    "TC a moneda marca", "Total moneda marca",
-]
-ENCABEZADOS_BO = [
-    "Fecha OC", "Año OC", "Mes", "Referencia", "Producto", "Descripcion", "Grupo", "Marca",
-    "Cantidad pdte", "moneda", "Precio", "Total Neto ME", "Moneda marca", "TC a moneda marca",
-    "Total moneda marca",
-]
+# Columna interna → encabezado en el Excel.
+COLUMNAS_FACT = {
+    "nombre": "Nombre de cliente/proveedor", "marca": "Proveedor", "fecha": "Fecha de contabilización",
+    "anio": "Año", "mes": "Mes", "folio": "Número de folio", "comentarios": "Comentarios",
+    "oc": "Orden de compra", "anio_oc": "Año de OC", "cat": "Categoria", "moneda_orig": "Moneda del documento",
+    "monto_orig": "Total documento (ME)", "moneda_marca": "Moneda marca", "tc": "TC a moneda marca",
+    "total": "Total moneda marca",
+}
+COLUMNAS_BO = {
+    "fecha": "Fecha OC", "anio": "Año OC", "mes": "Mes", "nombre": "Nombre proveedor", "referencia": "Referencia",
+    "producto": "Producto", "descripcion": "Descripcion", "cat": "Grupo", "marca": "Marca",
+    "cantidad": "Cantidad pdte", "moneda_orig": "moneda", "precio": "Precio", "monto_orig": "Total Neto ME",
+    "moneda_marca": "Moneda marca", "tc": "TC a moneda marca", "total": "Total moneda marca",
+}
+# Columnas que en el Excel son fórmulas: se recalculan y se comparan contra el cache.
+FORMULAS = {
+    "fact": ["marca", "anio", "mes", "anio_oc", "cat", "moneda_marca", "tc", "total"],
+    "bo": ["anio", "mes", "cat", "marca", "monto_orig", "moneda_marca", "tc", "total"],
+}
+# Compatibilidad: listas de encabezados requeridos
+ENCABEZADOS_FACTURACION = list(COLUMNAS_FACT.values())
+ENCABEZADOS_BO = list(COLUMNAS_BO.values())
 
 CATEGORIAS = ["Equipos", "Repuestos", "Accesorios", "Consumibles"]
 SIN_CATEGORIA = "Sin categoría"
@@ -75,7 +103,7 @@ FILA = {"fact": 3, "bo": 4, "factbo": 5, "forecast": 6, "cumpl": 7, "bo_total": 
 
 
 class ErrorCarga(Exception):
-    """Error que detiene la carga (hoja o encabezados faltantes, etc.)."""
+    """Error que detiene la carga (archivo, hoja o encabezados faltantes, etc.)."""
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -94,6 +122,7 @@ def txt(v) -> str:
 
 
 def clave(v) -> str:
+    """Clave normalizada para comparar: trim + minúsculas; 123.0 y "123" → "123"."""
     return txt(v).lower()
 
 
@@ -114,12 +143,16 @@ def es_num(x) -> bool:
     return x is not None and x is not NO_NUM
 
 
+def es_numerico(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and not (isinstance(v, float) and math.isnan(v))
+
+
 def a_fecha(v):
     if isinstance(v, datetime):
         return v
     if isinstance(v, date):
         return datetime(v.year, v.month, v.day)
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
+    if es_numerico(v):
         try:
             return from_excel(v)
         except (ValueError, OverflowError):
@@ -172,18 +205,183 @@ def hoja_oculta(ws) -> bool:
     return ws.sheet_state != "visible"
 
 
+def fmt_cl(v: float, decimales: int = 2) -> str:
+    """Formato es-CL: miles con punto, decimales con coma."""
+    return f"{v:,.{decimales}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def fmt_monto(v) -> str:
+    if not es_numerico(v):
+        return "—"
+    s = fmt_cl(v, 2)
+    return s[:-3] if s.endswith(",00") else s
+
+
+def _lista(arr, n=8):
+    return " · ".join(arr[:n]) + (f" · … ({len(arr)} en total)" if len(arr) > n else "")
+
+
 # ──────────────────────────────────────────────────────────────────────
-# LECTURA DE BBDD (por nombre de encabezado)
+# SELECCIÓN DEL ARCHIVO
 # ──────────────────────────────────────────────────────────────────────
 
-def leer_tabla(wb, nombre: str, requeridos: list[str]) -> dict:
-    # Búsqueda por nombre EXACTO: "BBDD Facturacion" ≠ "BBDD Facturacion ".
+def _versiones(carpeta: Path) -> list[tuple[date, Path]]:
+    """Archivos AAAAMMDD*.xlsx de la carpeta (no recursivo), sin "~$". Error si la fecha no es válida."""
+    versiones = []
+    for p in sorted(carpeta.iterdir()) if carpeta.is_dir() else []:
+        if not p.is_file() or p.name.startswith("~$"):
+            continue
+        m = PATRON_ARCHIVO.match(p.name)
+        if not m:
+            continue
+        try:
+            fecha = datetime.strptime(m.group(1), "%Y%m%d").date()
+        except ValueError:
+            raise ErrorCarga(f'La fecha del nombre no es válida: "{p.name}" ({m.group(1)} no es AAAAMMDD).')
+        versiones.append((fecha, p))
+    return versiones
+
+
+def _duplicadas(versiones, carpeta):
+    vistas: dict = {}
+    for f, p in versiones:
+        vistas.setdefault(f, []).append(p.name)
+    dup = {f: ns for f, ns in vistas.items() if len(ns) > 1}
+    if dup:
+        detalle = "; ".join(f'{f:%Y%m%d}: {", ".join(ns)}' for f, ns in dup.items())
+        raise ErrorCarga(f"Hay dos o más archivos con la misma fecha en {carpeta}/: {detalle}.")
+
+
+def seleccionar_actual(carpeta: Path = CARPETA_EXCEL) -> dict:
+    """El .xlsx de data/raw/ con la fecha (del nombre) más reciente."""
+    versiones = _versiones(carpeta)
+    if not versiones:
+        raise ErrorCarga(f"No hay archivos válidos en {carpeta}/: se espera un .xlsx cuyo nombre empiece con la fecha AAAAMMDD.")
+    _duplicadas(versiones, carpeta)
+    fecha, ruta = max(versiones)
+    avisos = []
+    if len(versiones) > 1:
+        otros = ", ".join(f'"{p.name}"' for f, p in sorted(versiones) if p != ruta)
+        avisos.append(f'Hay {len(versiones)} archivos .xlsx en {carpeta}/: se usó "{ruta.name}" (fecha más reciente). '
+                      f"Los demás deberían ir a {carpeta}/{NOMBRE_CARPETA_ANTERIORES}/: {otros}.")
+    return {"ruta": ruta, "fecha": fecha, "avisos": avisos}
+
+
+def carpeta_anteriores(carpeta: Path = CARPETA_EXCEL) -> Path | None:
+    if not carpeta.is_dir():
+        return None
+    for p in carpeta.iterdir():
+        if p.is_dir() and p.name.lower() == NOMBRE_CARPETA_ANTERIORES:
+            return p
+    return None
+
+
+def seleccionar_anterior(fecha_actual: date, carpeta: Path = CARPETA_EXCEL) -> dict | None:
+    """La versión de data/raw/old/ con la fecha más reciente anterior a la actual (None si no hay)."""
+    old = carpeta_anteriores(carpeta)
+    if old is None:
+        return None
+    versiones = [(f, p) for f, p in _versiones(old) if f < fecha_actual]
+    if not versiones:
+        return None
+    _duplicadas(versiones, old)
+    fecha, ruta = max(versiones)
+    return {"ruta": ruta, "fecha": fecha}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# PARÁMETROS (Proveedor, Diccionario, Moneda)
+# ──────────────────────────────────────────────────────────────────────
+
+def _hoja(wb, nombre):
     if nombre not in wb.sheetnames:
-        hojas = ", ".join(f'"{n}"' for n in wb.sheetnames)
+        raise ErrorCarga(f'No se encontró la hoja "{nombre}" (se busca por nombre exacto).')
+    return wb[nombre]
+
+
+def _tabla_busqueda(ws, col_clave: int, cols_valor: dict, nombre: str, problemas: list, desde: int = 1) -> dict:
+    """Como XLOOKUP sobre la columna completa: primera aparición de cada clave normalizada.
+    Avisa si una clave repetida tiene valores distintos."""
+    tabla, filas_por_clave = {}, {}
+    errores_ref = []
+    for r in range(desde, ws.max_row + 1):
+        k = clave(ws.cell(r, col_clave).value)
+        if not k:
+            continue
+        if k.startswith("#"):
+            errores_ref.append(f"{get_column_letter(col_clave)}{r}")
+            continue
+        vals = {n: ws.cell(r, c).value for n, c in cols_valor.items()}
+        if k not in tabla:
+            tabla[k] = (r, vals)
+            filas_por_clave[k] = [(r, vals)]
+        else:
+            filas_por_clave[k].append((r, vals))
+    difieren = []
+    for k, filas in filas_por_clave.items():
+        if len(filas) > 1 and len({tuple(clave(v) for v in vals.values()) for _, vals in filas}) > 1:
+            difieren.append(f'"{k}" en filas {", ".join(str(r) for r, _ in filas)} ('
+                            + " / ".join(", ".join(txt(v) or "(vacío)" for v in vals.values()) for _, vals in filas)
+                            + "); se usa la primera")
+    if difieren:
+        problemas.append({"nivel": "aviso", "titulo": f'{nombre}: {len(difieren)} códigos repetidos con categorías distintas', "detalle": _lista(difieren)})
+    if errores_ref:
+        problemas.append({"nivel": "aviso", "titulo": f'{nombre}: {len(errores_ref)} celdas con error (#REF!, etc.) en la columna de códigos', "detalle": _lista(errores_ref, 12)})
+    return tabla
+
+
+def leer_parametros(wb, problemas: list) -> dict:
+    prov_ws = _hoja(wb, HOJA_PROVEEDOR)
+    dic_ws = _hoja(wb, HOJA_DICCIONARIO)
+    mon_ws = _hoja(wb, HOJA_MONEDA)
+
+    proveedores = _tabla_busqueda(prov_ws, 1, {"marca": 2}, HOJA_PROVEEDOR, problemas)
+    folios = _tabla_busqueda(dic_ws, 2, {"cat": 3, "anio_oc": 4}, f"{HOJA_DICCIONARIO} (folios, columnas B:D)", problemas)
+    productos = _tabla_busqueda(dic_ws, 7, {"cat": 8}, f"{HOJA_DICCIONARIO} (productos, columnas G:H)", problemas)
+
+    marcas, pares, tc_invalidos = {}, {}, []
+    lista_marcas = []
+    for r in range(2, mon_ws.max_row + 1):
+        marca, mon = mon_ws.cell(r, 1).value, mon_ws.cell(r, 2).value
+        if txt(marca):
+            lista_marcas.append({"marca": str(marca), "clave": clave(marca), "moneda": txt(mon), "celda": f"A{r}"})
+            marcas.setdefault(clave(marca), txt(mon))
+        par, tc = txt(mon_ws.cell(r, 4).value), mon_ws.cell(r, 5).value
+        if par:
+            if not es_numerico(tc):
+                tc_invalidos.append(f'{HOJA_MONEDA}!E{r} ({par}) = {tc!r}'
+                                    + (" — está como texto: escríbelo como número, con coma decimal" if isinstance(tc, str) else " — vacío"))
+            pares.setdefault(clave(par), {"par": par, "tc": float(tc) if es_numerico(tc) else tc, "celda": f"E{r}"})
+    if tc_invalidos:
+        problemas.append({"nivel": "error", "bloqueante": True,
+                          "titulo": f'{HOJA_MONEDA}: {len(tc_invalidos)} tipos de cambio no numéricos', "detalle": _lista(tc_invalidos)})
+    else:
+        problemas.append({"nivel": "ok", "titulo": f'Todos los tipos de cambio de "{HOJA_MONEDA}" son numéricos ({len(pares)} pares)'})
+    return {"proveedores": proveedores, "folios": folios, "productos": productos,
+            "monedas": marcas, "lista_marcas": lista_marcas, "pares": pares}
+
+
+def _buscar(tabla: dict, k, campo: str, defecto):
+    """XLOOKUP: clave vacía o no encontrada → defecto; encontrada con celda vacía → ""."""
+    kk = clave(k)
+    if not kk or kk not in tabla:
+        return defecto
+    v = tabla[kk][1][campo]
+    return "" if v is None else v
+
+
+# ──────────────────────────────────────────────────────────────────────
+# LECTURA Y RECÁLCULO DE BBDD
+# ──────────────────────────────────────────────────────────────────────
+
+def leer_tabla(wb_v, wb_f, nombre: str, columnas: dict, formulas: list[str]) -> dict:
+    # Búsqueda por nombre EXACTO: "BBDD Facturacion" ≠ "BBDD Facturacion ".
+    if nombre not in wb_v.sheetnames:
+        hojas = ", ".join(f'"{n}"' for n in wb_v.sheetnames)
         raise ErrorCarga(f'No se encontró la hoja "{nombre}" (se busca por nombre exacto). Hojas del libro: {hojas}.')
-    ws = wb[nombre]
-    filas = ws.iter_rows(min_row=1, min_col=1, values_only=True)
-    encabezado = next(filas, None)
+    ws = wb_v[nombre]
+    filas_v = ws.iter_rows(min_row=1, min_col=1, values_only=True)
+    encabezado = next(filas_v, None)
     if not encabezado:
         raise ErrorCarga(f'La hoja "{nombre}" está vacía.')
     col: dict[str, int] = {}
@@ -191,79 +389,147 @@ def leer_tabla(wb, nombre: str, requeridos: list[str]) -> dict:
         k = txt(h)
         if k and k not in col:
             col[k] = i
-    faltan = [h for h in requeridos if h not in col]
+    faltan = [h for h in columnas.values() if h not in col]
     if faltan:
         raise ErrorCarga(f'La hoja "{nombre}" no tiene los encabezados requeridos: '
                          + ", ".join(f'"{h}"' for h in faltan)
                          + ". Se detuvo la carga para no leer una base equivocada.")
+    idx = {k: col[h] for k, h in columnas.items()}
+    i_formulas = {idx[k] for k in formulas}
+    crudas = [i for i in range(len(encabezado)) if i not in i_formulas]
+    filas_f = wb_f[nombre].iter_rows(min_row=2, min_col=1, values_only=True) if wb_f is not None else repeat(None)
     datos = []
-    for n, fila in enumerate(filas, start=2):
-        valores = {h: (fila[col[h]] if col[h] < len(fila) else None) for h in requeridos}
-        if all(txt(v) == "" for v in valores.values()):
+    for n, (fv, ff) in enumerate(zip(filas_v, filas_f), start=2):
+        # Filas sin ningún dato crudo (p. ej. filas con fórmulas arrastradas al final) se ignoran.
+        if all(txt(fv[i]) == "" for i in crudas if i < len(fv)):
             continue
-        datos.append({"fila": n, "c": valores})
+        c = {k: (fv[i] if i < len(fv) else None) for k, i in idx.items()}
+        f = {k: (ff[idx[k]] if ff is not None and idx[k] < len(ff) else None) for k in formulas} if ff is not None else None
+        datos.append({"fila": n, "c": c, "f": f})
     return {"nombre": nombre, "filas": datos, "oculta": hoja_oculta(ws)}
 
 
-MAPEO = {
-    "fact": {"marca": "Proveedor", "fecha": "Fecha de contabilización", "anio": "Año", "mes": "Mes",
-             "moneda_orig": "Moneda del documento", "monto_orig": "Total documento (ME)", "grupo": "Categoria"},
-    "bo": {"marca": "Marca", "fecha": "Fecha OC", "anio": "Año OC", "mes": "Mes",
-           "moneda_orig": "moneda", "monto_orig": "Total Neto ME", "grupo": "Grupo"},
-}
+def recalcular_fila(tipo: str, c: dict, p: dict) -> dict:
+    """Replica las fórmulas del Excel desde los datos crudos."""
+    fecha = a_fecha(c["fecha"])
+    marca = _buscar(p["proveedores"], c["nombre"], "marca", "")
+    r = {"fecha": fecha, "marca": marca,
+         "anio": fecha.year if fecha else None, "mes": MESES[fecha.month - 1] if fecha else None}
+    if tipo == "fact":
+        r["cat"] = _buscar(p["folios"], c["folio"], "cat", "ERROR")
+        r["anio_oc"] = _buscar(p["folios"], c["folio"], "anio_oc", "error")
+        monto = c["monto_orig"] if c["monto_orig"] is not None else 0.0
+    else:
+        r["cat"] = _buscar(p["productos"], c["producto"], "cat", "ERROR")
+        precio = c["precio"] if c["precio"] is not None else 0.0
+        cant = c["cantidad"] if c["cantidad"] is not None else 0.0
+        monto = precio * cant if es_numerico(precio) and es_numerico(cant) else "#VALUE!"
+        r["monto_orig"] = monto
+    moneda_doc = c["moneda_orig"]
+    km = clave(marca)
+    r["moneda_marca"] = p["monedas"][km] if km and km in p["monedas"] else ("" if moneda_doc is None else moneda_doc)
+    if clave(moneda_doc) == "" or clave(moneda_doc) == clave(r["moneda_marca"]):
+        r["tc"] = 1.0
+    else:
+        par = p["pares"].get(clave(f"{txt(moneda_doc)}>{txt(r['moneda_marca'])}"))
+        r["tc"] = "FALTA TC" if par is None else par["tc"]
+    r["total"] = monto * r["tc"] if es_numerico(monto) and es_numerico(r["tc"]) else "#VALUE!"
+    return r
 
 
-def normalizar(tabla: dict, tipo: str, chk: dict) -> dict:
-    m = MAPEO[tipo]
-    registros = []
-    corte = None
+def _iguales(calc, cache) -> bool:
+    calc_vacio, cache_vacio = calc is None or calc == "", cache is None or cache == ""
+    if calc_vacio and cache_vacio:
+        return True
+    if calc_vacio and cache == 0:      # XLOOKUP que encuentra una celda vacía devuelve 0
+        return True
+    if es_numerico(calc) and es_numerico(cache):
+        return abs(calc - cache) <= 1e-6 * max(1.0, abs(calc))
+    return clave(calc) == clave(cache)
+
+
+def _desc_doc(tipo, c) -> str:
+    if tipo == "fact":
+        return f'folio {txt(c["folio"]) or "(vacío)"}'
+    return f'OC {txt(c["referencia"]) or "(vacía)"} · producto {txt(c["producto"]) or "(vacío)"}'
+
+
+def normalizar(tabla: dict, tipo: str, p: dict, problemas: list) -> dict:
+    """Recalcula cada fila, la compara contra el cache y arma los registros (con los valores recalculados)."""
+    columnas = COLUMNAS_FACT if tipo == "fact" else COLUMNAS_BO
+    registros, corte = [], None
+    errores, avisos_cat, fijas, sin_fecha = [], [], [], []
     for f in tabla["filas"]:
-        c = f["c"]
-        ref = f'{tabla["nombre"]} fila {f["fila"]}'
-        fecha = a_fecha(c[m["fecha"]])
-        if fecha is None:
-            chk["fechas"].append(ref)
+        c, n = f["c"], f["fila"]
+        calc = recalcular_fila(tipo, c, p)
+        doc = _desc_doc(tipo, c)
+        if calc["fecha"] is None:
+            sin_fecha.append(f'fila {n} ({doc})')
             continue
-        if corte is None or fecha > corte:
-            corte = fecha
-        anio, mes = fecha.year, fecha.month - 1
-        if numero(c[m["anio"]]) != anio or clave(c[m["mes"]]) != MESES[mes]:
-            chk["anio_mes"].append(ref)
-
-        total = numero(c["Total moneda marca"])
-        if total is NO_NUM:
-            chk["totales"].append(ref)
-        tc = numero(c["TC a moneda marca"])
-        if not es_num(tc):
-            chk["tc"].append(f'{ref} ("{txt(c["TC a moneda marca"])}")')
-        monto_orig = numero(c[m["monto_orig"]])
-
+        difs = []
+        for k in FORMULAS[tipo]:
+            formula = f["f"][k] if f["f"] is not None else None
+            tiene_formula = isinstance(formula, str) and formula.startswith("=")
+            if not _iguales(calc[k], c[k]):
+                vacia = c[k] is None or c[k] == ""
+                motivo = "celda vacía (falta la fórmula)" if vacia else ("valor fijo sin fórmula" if f["f"] is not None and not tiene_formula else "valor distinto")
+                difs.append((k, motivo))
+            elif f["f"] is not None and not tiene_formula and c[k] is not None:
+                fijas.append(f'fila {n} col "{columnas[k]}"')
+        if difs:
+            monto_cero = es_numerico(calc["total"]) and calc["total"] == 0 and (tipo == "fact" or not c["cantidad"])
+            detalle = "; ".join(f'"{columnas[k]}" Excel={c[k]!r} recalculado={calc[k]!r} ({m})' for k, m in difs)
+            texto = f'{tabla["nombre"]} fila {n} · {doc} · marca "{txt(calc["marca"])}": {detalle}'
+            if [k for k, _ in difs] == ["cat"] and monto_cero:
+                avisos_cat.append(texto)
+            else:
+                errores.append(texto)
+        if not corte or calc["fecha"] > corte:
+            corte = calc["fecha"]
+        fecha = calc["fecha"]
+        monto_orig = numero(calc["monto_orig"] if tipo == "bo" else c["monto_orig"])
         reg = {
-            "tipo": tipo, "fila": f["fila"], "fecha": fecha, "anio": anio, "mes": mes,
-            "marca": txt(c[m["marca"]]), "marca_clave": clave(c[m["marca"]]),
-            "moneda_orig": txt(c[m["moneda_orig"]]),
+            "tipo": tipo, "fila": n, "fecha": fecha, "anio": fecha.year, "mes": fecha.month - 1,
+            "marca": txt(calc["marca"]), "marca_clave": clave(calc["marca"]),
+            "moneda_orig": txt(c["moneda_orig"]),
             "monto_orig": monto_orig if es_num(monto_orig) else 0.0,
-            "moneda_marca": txt(c["Moneda marca"]),
-            "tc": tc if es_num(tc) else None,
-            "total": total if es_num(total) else 0.0,
-            "cat_raw": txt(c[m["grupo"]]),
-            "cat": categoria(c[m["grupo"]]),
+            "moneda_marca": txt(calc["moneda_marca"]),
+            "tc": calc["tc"] if es_numerico(calc["tc"]) else None,
+            "tc_texto": None if es_numerico(calc["tc"]) else txt(calc["tc"]),
+            "total": calc["total"] if es_numerico(calc["total"]) else 0.0,
+            "cat_raw": txt(calc["cat"]),
+            "cat": categoria(calc["cat"]),
         }
         if tipo == "fact":
-            reg["folio"] = txt(c["Número de folio"])
-            reg["comentarios"] = txt(c["Comentarios"])
-            reg["oc"] = txt(c["Orden de compra"])
+            reg["folio"] = txt(c["folio"])
+            reg["comentarios"] = txt(c["comentarios"])
+            reg["oc"] = txt(c["oc"])
         else:
-            cant = numero(c["Cantidad pdte"])
-            precio = numero(c["Precio"])
-            reg["referencia"] = txt(c["Referencia"])
-            reg["producto"] = txt(c["Producto"])
-            reg["descripcion"] = txt(c["Descripcion"])
+            cant, precio = numero(c["cantidad"]), numero(c["precio"])
+            reg["referencia"] = txt(c["referencia"])
+            reg["producto"] = txt(c["producto"])
+            reg["descripcion"] = txt(c["descripcion"])
             reg["cantidad"] = cant if es_num(cant) else 0.0
             reg["precio"] = precio if es_num(precio) else 0.0
         reg["convertido"] = bool(reg["moneda_orig"]) and clave(reg["moneda_orig"]) != clave(reg["moneda_marca"])
         registros.append(reg)
-    return {"registros": registros, "corte": corte}
+
+    nombre = tabla["nombre"]
+    if sin_fecha:
+        problemas.append({"nivel": "error", "bloqueante": True, "titulo": f'{nombre}: {len(sin_fecha)} filas con datos sin fecha válida', "detalle": _lista(sin_fecha)})
+    if errores:
+        problemas.append({"nivel": "error", "bloqueante": True,
+                          "titulo": f'{nombre}: {len(errores)} filas donde el valor de una fórmula no coincide con el recalculado (fórmula vacía o desactualizada)',
+                          "detalle": _lista(errores, 30), "filas": errores})
+    else:
+        problemas.append({"nivel": "ok", "titulo": f'{nombre}: las {len(tabla["filas"])} filas con datos coinciden con el recálculo en Python (marca, año, mes, categoría, moneda, TC y total)'
+                          + (f", salvo {len(avisos_cat)} con solo la categoría distinta y monto 0" if avisos_cat else "")})
+    if avisos_cat:
+        problemas.append({"nivel": "aviso", "titulo": f'{nombre}: {len(avisos_cat)} filas con cantidad y monto 0 donde solo difiere la categoría (valor de Excel desactualizado)',
+                          "detalle": _lista(avisos_cat, 30), "filas": avisos_cat})
+    if fijas:
+        problemas.append({"nivel": "aviso", "titulo": f'{nombre}: {len(fijas)} celdas con valor fijo en vez de fórmula (hoy coinciden con el recálculo)', "detalle": _lista(fijas, 12)})
+    return {"registros": registros, "corte": corte, "errores_fila": errores}
 
 
 def indexar(registros: list[dict]) -> dict:
@@ -278,21 +544,6 @@ def indexar(registros: list[dict]) -> dict:
         e["cat"][r["cat"]] += r["total"]
         e["filas"].append(r)
     return idx
-
-
-def leer_parametros_moneda(wb) -> dict:
-    if HOJA_MONEDA not in wb.sheetnames:
-        raise ErrorCarga(f'No se encontró la hoja "{HOJA_MONEDA}".')
-    ws = wb[HOJA_MONEDA]
-    marcas, pares = [], {}
-    for r in range(2, ws.max_row + 1):
-        marca, mon = valor(ws, r, 0), valor(ws, r, 1)
-        if txt(marca):
-            marcas.append({"marca": str(marca), "clave": clave(marca), "moneda": txt(mon), "celda": f"A{r}"})
-        par, tc = txt(valor(ws, r, 3)), numero(valor(ws, r, 4))
-        if par:
-            pares[par] = {"tc": tc if es_num(tc) else None, "celda": f"E{r}"}
-    return {"marcas": marcas, "pares": pares}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -473,46 +724,92 @@ def resumen_conversion(calc: dict) -> list[dict]:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# PROCESO COMPLETO
+# VALIDACIONES DE MARCAS VISIBLES
 # ──────────────────────────────────────────────────────────────────────
 
-def _lista(arr, n=8):
-    return " · ".join(arr[:n]) + (f" · … ({len(arr)} en total)" if len(arr) > n else "")
+def _desc_reg(r) -> str:
+    if r["tipo"] == "fact":
+        doc = f'folio {r["folio"]}' + (f' (OC {", ".join(ocs_mencionadas(r))})' if ocs_mencionadas(r) else "")
+        extra = ""
+    else:
+        doc = f'OC {r["referencia"] or "(vacía)"}'
+        extra = f' · producto {r["producto"] or "(vacío)"} · "{r["descripcion"]}"'
+    hoja = HOJA_FACTURACION if r["tipo"] == "fact" else HOJA_BO
+    return (f'{hoja} fila {r["fila"]} · {r["marca"]} · {r["fecha"]:%Y-%m-%d} · {doc}{extra} · '
+            f'{fmt_monto(r["monto_orig"])} {r["moneda_orig"] or "(sin moneda)"} → {fmt_monto(r["total"])} {r["moneda_marca"]}')
 
 
-def _fila_detalle_fact(r):
-    return {"fecha": r["fecha"].strftime("%Y-%m-%d"), "anio": r["anio"], "mes": r["mes"], "folio": r["folio"],
-            "comentarios": r["comentarios"], "oc": r["oc"], "cat": r["cat"], "catRaw": r["cat_raw"],
-            "monedaOrig": r["moneda_orig"], "montoOrig": r["monto_orig"], "tc": r["tc"], "total": r["total"],
-            "convertido": r["convertido"]}
+def validar_marcas(marcas: list[dict], registros: list[dict], params: dict, problemas: list, permitir_sin_categoria: bool):
+    por_marca: dict = {}
+    for r in registros:
+        por_marca.setdefault(r["marca_clave"], []).append(r)
+
+    sin_cat, monedas_mal = [], []
+    for m in marcas:
+        regs = por_marca.get(m["clave"], [])
+        periodos = {(x["anio"], x["mes"]) for b in m["bloques"] for x in b["meses"]}
+        for r in regs:
+            if r["cat"] != SIN_CATEGORIA:
+                continue
+            if (r["tipo"] == "fact" and (r["anio"], r["mes"]) in periodos) or (r["tipo"] == "bo" and r["cantidad"] > 0):
+                sin_cat.append(f'{_desc_reg(r)} · categoría "{r["cat_raw"] or "(vacía)"}"')
+        # Moneda de reporte: la de Parametros Moneda o, si la marca no está, la de la mayoría de sus documentos.
+        en_param = m["clave"] in params["monedas"]
+        if en_param:
+            reporte = params["monedas"][m["clave"]]
+        else:
+            cuenta: dict = {}
+            for r in regs:
+                if r["moneda_marca"]:
+                    cuenta[r["moneda_marca"]] = cuenta.get(r["moneda_marca"], 0) + 1
+            reporte = max(cuenta, key=cuenta.get) if cuenta else ""
+        m["moneda_reporte"] = reporte
+        for r in regs:
+            if r["tc"] is None:
+                monedas_mal.append(f'{_desc_reg(r)} · falta el TC "{r["moneda_orig"]}>{r["moneda_marca"]}" en {HOJA_MONEDA}')
+            elif not en_param and r["moneda_marca"] and r["moneda_marca"] != reporte:
+                monedas_mal.append(f'{_desc_reg(r)} · {m["nombre"]} se reporta en {reporte} y no está en {HOJA_MONEDA}: '
+                                   f'agrega la marca (A:B) y el par "{r["moneda_orig"]}>{reporte}" (D:E)')
+    if sin_cat:
+        problemas.append({"nivel": "aviso" if permitir_sin_categoria else "error", "bloqueante": not permitir_sin_categoria,
+                          "titulo": f"{len(sin_cat)} documentos de marcas visibles sin categoría estándar (facturación del período y BO con cantidad pendiente)"
+                          + (" — se continúa por --permitir-sin-categoria" if permitir_sin_categoria else " — usa --permitir-sin-categoria para continuar"),
+                          "detalle": _lista(sin_cat, 40), "filas": sin_cat})
+    else:
+        problemas.append({"nivel": "ok", "titulo": "Categorías: toda la facturación del período y el BO pendiente de las marcas visibles es Equipos, Repuestos, Accesorios o Consumibles"})
+    if monedas_mal:
+        problemas.append({"nivel": "error", "bloqueante": True,
+                          "titulo": f"{len(monedas_mal)} documentos de marcas visibles fuera de la moneda de reporte y sin tipo de cambio",
+                          "detalle": _lista(monedas_mal, 30), "filas": monedas_mal})
+    else:
+        problemas.append({"nivel": "ok", "titulo": "Monedas: todos los documentos de las marcas visibles están en la moneda de reporte de su marca o tienen tipo de cambio"})
 
 
-def _fila_detalle_bo(r):
-    return {"fecha": r["fecha"].strftime("%Y-%m-%d"), "anio": r["anio"], "mes": r["mes"], "referencia": r["referencia"],
-            "producto": r["producto"], "descripcion": r["descripcion"], "cat": r["cat"], "cantidad": r["cantidad"],
-            "monedaOrig": r["moneda_orig"], "precio": r["precio"], "montoOrig": r["monto_orig"], "tc": r["tc"],
-            "total": r["total"], "convertido": r["convertido"]}
+# ──────────────────────────────────────────────────────────────────────
+# PROCESO DE UN LIBRO
+# ──────────────────────────────────────────────────────────────────────
+
+def fecha_desde_nombre(ruta: Path):
+    m = PATRON_ARCHIVO.match(ruta.name)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%d").date()
+    except ValueError:
+        return None
 
 
-def procesar_libro(ruta: Path | str, incluir_detalle: bool = INCLUIR_DETALLE) -> dict:
-    """Lee el Excel, calcula y concilia. Devuelve el diccionario que se serializa a JSON."""
+def calcular(ruta: Path | str, permitir_sin_categoria: bool = False) -> dict:
+    """Lee el Excel, recalcula, valida y concilia. Devuelve el resultado interno (con registros)."""
     ruta = Path(ruta)
     wb = openpyxl.load_workbook(ruta, data_only=True)
+    wb_f = openpyxl.load_workbook(ruta, data_only=False)
     problemas = []
-    chk = {"fechas": [], "anio_mes": [], "totales": [], "tc": []}
 
-    t_f = leer_tabla(wb, HOJA_FACTURACION, ENCABEZADOS_FACTURACION)
-    t_b = leer_tabla(wb, HOJA_BO, ENCABEZADOS_BO)
-    params = leer_parametros_moneda(wb)
-    n_f = normalizar(t_f, "fact", chk)
-    n_b = normalizar(t_b, "bo", chk)
-    idx_f, idx_b = indexar(n_f["registros"]), indexar(n_b["registros"])
-    cortes = [c for c in (n_f["corte"], n_b["corte"]) if c]
-    corte = max(cortes) if cortes else None
-    corte_idx = idx_mes(corte.year, corte.month - 1) if corte else 10 ** 9
-
-    problemas.append({"nivel": "ok", "titulo": f'Se leyó la hoja "{t_f["nombre"]}" (nombre exacto) · {len(t_f["filas"])} filas · encabezados validados'})
-    problemas.append({"nivel": "ok", "titulo": f'Se leyó la hoja "{t_b["nombre"]}" (nombre exacto) · {len(t_b["filas"])} filas · encabezados validados'})
+    t_f = leer_tabla(wb, wb_f, HOJA_FACTURACION, COLUMNAS_FACT, FORMULAS["fact"])
+    t_b = leer_tabla(wb, wb_f, HOJA_BO, COLUMNAS_BO, FORMULAS["bo"])
+    problemas.append({"nivel": "ok", "titulo": f'Se leyó la hoja "{t_f["nombre"]}" (nombre exacto) · {len(t_f["filas"])} filas con datos · encabezados validados'})
+    problemas.append({"nivel": "ok", "titulo": f'Se leyó la hoja "{t_b["nombre"]}" (nombre exacto) · {len(t_b["filas"])} filas con datos · encabezados validados'})
     for n in wb.sheetnames:
         if n != t_f["nombre"] and n.strip() == t_f["nombre"].strip():
             oculta = " (oculta)" if hoja_oculta(wb[n]) else ""
@@ -520,20 +817,16 @@ def procesar_libro(ruta: Path | str, incluir_detalle: bool = INCLUIR_DETALLE) ->
     if t_f["oculta"]:
         problemas.append({"nivel": "aviso", "titulo": f'La hoja "{t_f["nombre"]}" está oculta; se esperaba visible.'})
 
-    if chk["fechas"]:
-        problemas.append({"nivel": "error", "bloqueante": True, "titulo": f'{len(chk["fechas"])} filas sin fecha válida (no se suman)', "detalle": _lista(chk["fechas"])})
-    if chk["totales"]:
-        problemas.append({"nivel": "error", "bloqueante": True, "titulo": f'{len(chk["totales"])} filas con "Total moneda marca" no numérico', "detalle": _lista(chk["totales"])})
-    if chk["tc"]:
-        problemas.append({"nivel": "error", "bloqueante": True, "titulo": f'{len(chk["tc"])} filas con "TC a moneda marca" no numérico', "detalle": _lista(chk["tc"])})
-    else:
-        problemas.append({"nivel": "ok", "titulo": 'Todos los "TC a moneda marca" son numéricos'})
-    if chk["anio_mes"]:
-        problemas.append({"nivel": "aviso", "titulo": f'{len(chk["anio_mes"])} filas donde Año/Mes cacheados no coinciden con la fecha (se usa la fecha)', "detalle": _lista(chk["anio_mes"])})
-    else:
-        problemas.append({"nivel": "ok", "titulo": "Año y Mes derivados de la fecha coinciden con las columnas del Excel en todas las filas"})
+    params = leer_parametros(wb, problemas)
+    n_f = normalizar(t_f, "fact", params, problemas)
+    n_b = normalizar(t_b, "bo", params, problemas)
+    idx_f, idx_b = indexar(n_f["registros"]), indexar(n_b["registros"])
+    cortes = [c for c in (n_f["corte"], n_b["corte"]) if c]
+    corte = max(cortes) if cortes else None
+    corte_idx = idx_mes(corte.year, corte.month - 1) if corte else 10 ** 9
 
     ocultas, marcas = [], []
+    todos = n_f["registros"] + n_b["registros"]
     for nombre in wb.sheetnames:
         ws = wb[nombre]
         if hoja_oculta(ws):
@@ -556,61 +849,22 @@ def procesar_libro(ruta: Path | str, incluir_detalle: bool = INCLUIR_DETALLE) ->
             b["calc"] = calcular_bloque(b, mc, idx_f, idx_b, corte_idx)
             b["conc"] = conciliar_bloque(b, b["calc"])
             b["conversion"] = resumen_conversion(b["calc"])
-
-        # Moneda marca única en ambas BBDD
-        regs = [r for r in n_f["registros"] if r["marca_clave"] == mc] + [r for r in n_b["registros"] if r["marca_clave"] == mc]
-        por_moneda: dict = {}
-        for r in regs:
-            k = r["moneda_marca"] if r["moneda_marca"] and r["moneda_marca"] != "0" else "(vacía o 0)"
-            por_moneda.setdefault(k, []).append(r)
-        monedas = sorted(por_moneda, key=lambda k: -len(por_moneda[k]))
-        param = next((p for p in params["marcas"] if p["clave"] == mc), None)
-        moneda = next((m for m in monedas if m != "(vacía o 0)"), None) or (param and param["moneda"]) or "—"
-        if len(monedas) > 1:
-            def desc(k):
-                rs = por_moneda[k]
-                s = f"{k}: {len(rs)} filas"
-                if len(rs) <= 3:
-                    s += " (" + "; ".join(f'{HOJA_FACTURACION if r["tipo"] == "fact" else HOJA_BO} fila {r["fila"]}, total {r["total"]:g}' for r in rs) + ")"
-                return s
-            problemas.append({"nivel": "error", "marca": nombre_marca,
-                              "titulo": f'{nombre_marca}: tiene {len(monedas)} valores distintos de "Moneda marca" en las BBDD',
-                              "detalle": " · ".join(desc(k) for k in monedas)})
-
-        # Conversión de moneda: TC usados vs Parametros Moneda
-        convertidos = [r for r in regs if r["convertido"]]
-        distintos = []
-        for r in convertidos:
-            par = params["pares"].get(f'{r["moneda_orig"]}>{r["moneda_marca"]}')
-            if not par or par["tc"] != r["tc"]:
-                distintos.append(r)
-        if distintos:
-            problemas.append({"nivel": "aviso", "marca": nombre_marca,
-                              "titulo": f'{nombre_marca}: {len(distintos)} filas convertidas con TC distinto al de "{HOJA_MONEDA}"',
-                              "detalle": " · ".join(f'fila {r["fila"]}: {r["moneda_orig"]}>{r["moneda_marca"]} TC {r["tc"]}' for r in distintos[:6])})
+        regs = [r for r in todos if r["marca_clave"] == mc]
+        convertidos = [r for r in regs if r["convertido"] and r["tc"] is not None]
         pares_conv = []
         for r in convertidos:
-            p = {"orig": r["moneda_orig"], "dest": r["moneda_marca"], "tc": r["tc"]}
-            if p not in pares_conv:
-                pares_conv.append(p)
-
-        marca = {"hoja": nombre, "nombre": nombre_marca, "clave": mc, "moneda": moneda, "monedas": monedas,
-                 "bloques": bloques, "tieneFiscal": len(bloques) > 1, "convierte": bool(convertidos),
-                 "paresConversion": pares_conv, "sinFilas": not regs}
-        if incluir_detalle:
-            periodos = {(m["anio"], m["mes"]) for b in bloques for m in b["meses"]}
-            marca["detalle"] = {
-                "facturas": [_fila_detalle_fact(r) for r in regs if r["tipo"] == "fact" and (r["anio"], r["mes"]) in periodos],
-                "bo": [_fila_detalle_bo(r) for r in regs if r["tipo"] == "bo" and r["cantidad"] > 0],
-            }
-        marcas.append(marca)
-
+            par = {"orig": r["moneda_orig"], "dest": r["moneda_marca"], "tc": r["tc"]}
+            if par not in pares_conv:
+                pares_conv.append(par)
+        marcas.append({"hoja": nombre, "nombre": nombre_marca, "clave": mc, "bloques": bloques,
+                       "tieneFiscal": len(bloques) > 1, "convierte": bool(convertidos),
+                       "paresConversion": pares_conv, "sinFilas": not regs, "registros": regs})
     if not marcas:
         raise ErrorCarga('No se encontraron hojas de marca visibles (A2 = "Item" y A6 = "Forecast").')
-    ok_m = [m["nombre"] for m in marcas if len(m["monedas"]) <= 1]
-    if ok_m:
-        problemas.append({"nivel": "ok", "titulo": "Moneda marca única en ambas BBDD: " + ", ".join(ok_m)})
+
+    validar_marcas(marcas, todos, params, problemas, permitir_sin_categoria)
     for m in marcas:
+        m["moneda"] = m["moneda_reporte"] or "—"
         if m["sinFilas"]:
             problemas.append({"nivel": "info", "titulo": f'{m["nombre"]}: no tiene filas en ninguna BBDD'})
     if ocultas:
@@ -625,32 +879,306 @@ def procesar_libro(ruta: Path | str, incluir_detalle: bool = INCLUIR_DETALLE) ->
         "erroresBloqueantes": sum(1 for p in problemas if p.get("bloqueante")),
         "avisos": sum(1 for p in problemas if p["nivel"] == "aviso"),
     }
-
-    def fecha_txt(d):
-        return d.strftime("%Y-%m-%d") if d else None
-
     return {
-        "meta": {
-            "archivo": ruta.name,
-            "generado": datetime.now().isoformat(timespec="seconds"),
-            "incluirDetalle": incluir_detalle,
-            "hojas": {"facturacion": HOJA_FACTURACION, "bo": HOJA_BO, "moneda": HOJA_MONEDA},
-            "fact": {"hoja": t_f["nombre"], "filas": len(t_f["filas"]), "corte": fecha_txt(n_f["corte"])},
-            "bo": {"hoja": t_b["nombre"], "filas": len(t_b["filas"]), "corte": fecha_txt(n_b["corte"])},
-            "corte": fecha_txt(corte),
-            "tolerancia": {"monto": TOLERANCIA_MONTO, "pct": TOLERANCIA_PCT},
-            "categorias": CATEGORIAS, "sinCategoria": SIN_CATEGORIA,
-        },
+        "ruta": ruta, "fecha_archivo": fecha_desde_nombre(ruta),
+        "t_f": t_f, "t_b": t_b, "corte_f": n_f["corte"], "corte_b": n_b["corte"], "corte": corte,
+        "params": params, "registros_f": n_f["registros"], "registros_b": n_b["registros"],
+        "idx_f": idx_f, "idx_b": idx_b, "marcas": marcas, "problemas": problemas, "ocultas": ocultas,
         "resumen": resumen,
-        "problemas": problemas,
-        "ocultas": ocultas,
-        "parametros": {"pares": params["pares"], "marcas": [{"marca": p["marca"], "moneda": p["moneda"]} for p in params["marcas"]]},
-        "marcas": [_serializar_marca(m) for m in marcas],
     }
 
 
-def _serializar_marca(m: dict) -> dict:
-    salida = {k: v for k, v in m.items() if k != "bloques"}
+# ──────────────────────────────────────────────────────────────────────
+# COMPARACIÓN CONTRA LA VERSIÓN ANTERIOR
+# ──────────────────────────────────────────────────────────────────────
+
+_PATRON_OC = re.compile(r"(?<!\d)(\d{1,6})\s*/\s*(\d{2})(?!\d)")
+
+
+def _norm_oc(texto: str) -> set[str]:
+    """OC tipo "1450/26" o "02466/25" → {"1450/26", "2466/25"} (sin ceros a la izquierda)."""
+    return {f"{int(a)}/{b}" for a, b in _PATRON_OC.findall(texto or "")}
+
+
+def ocs_mencionadas(r) -> list[str]:
+    return sorted(_norm_oc(f'{r.get("comentarios", "")} {r.get("oc", "")}'))
+
+
+def _agrupar_docs(registros, tipo):
+    """Documento → {(año, mes): {total, orig, cant}} y datos del documento."""
+    docs: dict = {}
+    for r in registros:
+        if tipo == "fact":
+            k = (r["marca_clave"], clave(r["folio"]))
+        else:
+            k = (r["marca_clave"], clave(r["referencia"]), clave(r["producto"]))
+        d = docs.setdefault(k, {"meses": {}, "regs": [], "cat": set()})
+        e = d["meses"].setdefault((r["anio"], r["mes"]), {"total": 0.0, "orig": 0.0, "cant": 0.0, "tc": set(), "moneda": set()})
+        e["total"] += r["total"]
+        e["orig"] += r["monto_orig"]
+        e["cant"] += r.get("cantidad", 0.0)
+        e["tc"].add(r["tc"])
+        e["moneda"].add((r["moneda_orig"], r["moneda_marca"]))
+        d["regs"].append(r)
+        d["cat"].add(r["cat"])
+    return docs
+
+
+def _doc_texto(tipo, k, d) -> str:
+    r = d["regs"][0]
+    if tipo == "fact":
+        ocs = sorted({oc for x in d["regs"] for oc in ocs_mencionadas(x)})
+        return f'Folio {r["folio"]}' + (f' (OC {", ".join(ocs)})' if ocs else " (sin OC en Comentarios)") + f' · {r["fecha"]:%Y-%m-%d}'
+    return f'OC {r["referencia"] or "(vacía)"} · producto {r["producto"] or "(vacío)"} · {r["fecha"]:%Y-%m-%d}'
+
+
+def comparar_versiones(ant: dict, act: dict) -> dict:
+    """Compara dos resultados calculados con la misma lógica, por marca visible, año y mes."""
+    corte_f_ant = ant["corte_f"]
+    corte_b_ant = ant["corte_b"]
+    docs = {
+        "fact": (_agrupar_docs(ant["registros_f"], "fact"), _agrupar_docs(act["registros_f"], "fact")),
+        "bo": (_agrupar_docs(ant["registros_b"], "bo"), _agrupar_docs(act["registros_b"], "bo")),
+    }
+    ocs_bo_ant = {(k[0], k[1]) for k in docs["bo"][0]}
+    # OC mencionadas por facturas nuevas (folios agregados en la versión actual)
+    folios_nuevos = [d for k, d in docs["fact"][1].items() if k not in docs["fact"][0]]
+    ocs_facturadas: dict = {}
+    for d in folios_nuevos:
+        for r in d["regs"]:
+            for oc in ocs_mencionadas(r):
+                ocs_facturadas.setdefault((r["marca_clave"], oc), set()).add(r["folio"])
+
+    marcas_act = {m["clave"]: m for m in act["marcas"]}
+    marcas_ant = {m["clave"]: m for m in ant["marcas"]}
+    filas, cumplimientos, forecast, categorias = [], [], [], []
+
+    for mc, m in marcas_act.items():
+        periodos = []
+        for b in m["bloques"]:
+            for x in b["meses"]:
+                if (x["anio"], x["mes"]) not in periodos:
+                    periodos.append((x["anio"], x["mes"]))
+        for (anio, mes) in sorted(periodos):
+            fila = {"marca": m["nombre"], "clave": mc, "moneda": m["moneda"], "anio": anio, "mes": mes,
+                    "etiqueta": mes_corto(anio, mes), "items": []}
+            for tipo, idx_ant, idx_act in (("fact", ant["idx_f"], act["idx_f"]), ("bo", ant["idx_b"], act["idx_b"])):
+                v_ant = idx_ant.get((mc, anio, mes), {"total": 0.0})["total"]
+                v_act = idx_act.get((mc, anio, mes), {"total": 0.0})["total"]
+                fila[tipo] = {"ant": v_ant, "act": v_act, "dif": v_act - v_ant}
+                d_ant, d_act = docs[tipo]
+                explicado = 0.0
+                for k in set(d_ant) | set(d_act):
+                    if k[0] != mc:
+                        continue
+                    ea = d_ant.get(k, {"meses": {}})["meses"].get((anio, mes))
+                    en = d_act.get(k, {"meses": {}})["meses"].get((anio, mes))
+                    ta, tn = (ea["total"] if ea else 0.0), (en["total"] if en else 0.0)
+                    if abs(tn - ta) < 1e-9:
+                        continue
+                    explicado += tn - ta
+                    fila["items"].append(_clasificar(tipo, k, d_ant.get(k), d_act.get(k), ea, en, ta, tn,
+                                                     corte_f_ant, corte_b_ant, ocs_bo_ant, ocs_facturadas))
+                fila[tipo]["explicado"] = abs(explicado - fila[tipo]["dif"]) <= 0.005
+            fila["factbo"] = {k: fila["fact"][k] + fila["bo"][k] for k in ("ant", "act", "dif")}
+            if not fila["items"]:
+                continue
+            fila["estado"] = "revisar" if any(i["clase"] == "revisar" for i in fila["items"]) else "esperable"
+            filas.append(fila)
+
+        # Cumplimientos y forecast por bloque
+        m_ant = marcas_ant.get(mc)
+        for b in m["bloques"]:
+            b_ant = next((x for x in (m_ant["bloques"] if m_ant else []) if x["tipo"] == b["tipo"]), None)
+            if not b["calc"]:
+                continue
+            ca = b_ant["calc"] if b_ant else None
+            for q in range(4):
+                va = ca["trims"][q]["cumpl"] if ca else None
+                vn = b["calc"]["trims"][q]["cumpl"]
+                if va != vn and not (va is not None and vn is not None and abs(va - vn) < 1e-4):
+                    cumplimientos.append({"marca": m["nombre"], "bloque": b["titulo"], "nombre": f"Q{q + 1}", "ant": va, "act": vn})
+            va, vn = (ca["total"]["cumpl"] if ca else None), b["calc"]["total"]["cumpl"]
+            if va != vn and not (va is not None and vn is not None and abs(va - vn) < 1e-4):
+                cumplimientos.append({"marca": m["nombre"], "bloque": b["titulo"], "nombre": "Anual", "ant": va, "act": vn})
+            if b_ant:
+                for i, x in enumerate(b["meses"]):
+                    fa, fn = b_ant["fc_mes"][i] if i < len(b_ant["fc_mes"]) else None, b["fc_mes"][i]
+                    if (fa or 0) != (fn or 0) and abs((fa or 0) - (fn or 0)) > 1e-6:
+                        forecast.append({"marca": m["nombre"], "bloque": b["titulo"], "periodo": mes_corto(x["anio"], x["mes"]), "ant": fa, "act": fn})
+                if (b_ant["fc_total"] or 0) != (b["fc_total"] or 0):
+                    forecast.append({"marca": m["nombre"], "bloque": b["titulo"], "periodo": "Total", "ant": b_ant["fc_total"], "act": b["fc_total"]})
+
+    # Cambios de categoría (documentos presentes en ambas versiones)
+    for tipo in ("fact", "bo"):
+        d_ant, d_act = docs[tipo]
+        for k in set(d_ant) & set(d_act):
+            if k[0] in marcas_act and d_ant[k]["cat"] != d_act[k]["cat"]:
+                categorias.append({"marca": marcas_act[k[0]]["nombre"], "tipo": tipo, "doc": _doc_texto(tipo, k, d_act[k]),
+                                   "ant": ", ".join(sorted(d_ant[k]["cat"])), "act": ", ".join(sorted(d_act[k]["cat"]))})
+
+    # Cambios en Parametros Moneda
+    parametros = []
+    pa, pn = ant["params"], act["params"]
+    nombres = {p["clave"]: p["marca"].strip() for p in pa["lista_marcas"] + pn["lista_marcas"]}
+
+    def tc_txt(v):
+        return "(no estaba)" if v is None else (fmt_cl(v, 6).rstrip("0").rstrip(",") if es_numerico(v) else repr(v))
+
+    for k in sorted(set(pa["monedas"]) | set(pn["monedas"])):
+        if pa["monedas"].get(k) != pn["monedas"].get(k):
+            parametros.append(f'Moneda de reporte de {nombres.get(k, k)}: {pa["monedas"].get(k) or "(no estaba)"} → {pn["monedas"].get(k) or "(se quitó)"}')
+    for k in sorted(set(pa["pares"]) | set(pn["pares"])):
+        par = (pn["pares"].get(k) or pa["pares"].get(k))["par"]
+        ta, tn = (pa["pares"].get(k) or {}).get("tc"), (pn["pares"].get(k) or {}).get("tc")
+        if ta != tn:
+            parametros.append(f'Tipo de cambio {par}: {tc_txt(ta)} → {tc_txt(tn) if tn is not None else "(se quitó)"}')
+
+    return {
+        "anterior": {"archivo": ant["ruta"].name, "fecha": ant["fecha_archivo"], "corteFact": ant["corte_f"], "corteBO": ant["corte_b"]},
+        "actual": {"archivo": act["ruta"].name, "fecha": act["fecha_archivo"], "corteFact": act["corte_f"], "corteBO": act["corte_b"]},
+        "filas": filas, "cumplimientos": cumplimientos, "forecast": forecast,
+        "categorias": categorias, "parametros": parametros,
+    }
+
+
+def _clasificar(tipo, k, doc_ant, doc_act, ea, en, ta, tn, corte_f_ant, corte_b_ant, ocs_bo_ant, ocs_facturadas) -> dict:
+    """Clasifica la contribución de un documento a la diferencia de un mes."""
+    dif = tn - ta
+    doc = doc_act or doc_ant
+    texto = _doc_texto(tipo, k, doc)
+    mismo_orig = ea and en and abs(ea["orig"] - en["orig"]) < 1e-6 and ea["moneda"] == en["moneda"] and ea["cant"] == en["cant"]
+    if ea and en and mismo_orig and ea["tc"] != en["tc"]:
+        return {"tipo": tipo, "clase": "revisar", "causa": "Cambio de tipo de cambio (Parametros Moneda)", "doc": texto,
+                "ant": ta, "act": tn, "dif": dif, "tcAnt": sorted(x for x in ea["tc"] if x is not None), "tcAct": sorted(x for x in en["tc"] if x is not None)}
+    if tipo == "fact":
+        if doc_ant is None:
+            fecha = min(r["fecha"] for r in doc_act["regs"])
+            if corte_f_ant is None or fecha > corte_f_ant:
+                return {"tipo": tipo, "clase": "esperable", "causa": "Factura nueva posterior al corte anterior", "doc": texto, "ant": ta, "act": tn, "dif": dif}
+            return {"tipo": tipo, "clase": "revisar", "causa": "Folio nuevo con fecha retroactiva (anterior al corte anterior)", "doc": texto, "ant": ta, "act": tn, "dif": dif}
+        if doc_act is None:
+            return {"tipo": tipo, "clase": "revisar", "causa": "Folio que desaparece", "doc": texto, "ant": ta, "act": tn, "dif": dif}
+        if ea is None or en is None:
+            return {"tipo": tipo, "clase": "revisar", "causa": "Folio que cambia de fecha", "doc": texto, "ant": ta, "act": tn, "dif": dif}
+        return {"tipo": tipo, "clase": "revisar", "causa": "Folio que cambia de monto", "doc": texto, "ant": ta, "act": tn, "dif": dif}
+    # BO
+    oc = (k[0], next(iter(_norm_oc(doc["regs"][0]["referencia"])), clave(doc["regs"][0]["referencia"])))
+    cant = {"cantAnt": ea["cant"] if ea else 0.0, "cantAct": en["cant"] if en else 0.0}
+    if dif < 0:
+        facturas = sorted(ocs_facturadas.get(oc, set()))
+        if facturas:
+            return {"tipo": tipo, "clase": "esperable", "causa": "BO recibido/facturado (factura nueva que menciona la OC)",
+                    "doc": texto + f' · facturas {", ".join(facturas)}', "ant": ta, "act": tn, "dif": dif, **cant}
+        causa = "BO que desaparece sin factura nueva que mencione la OC" if not en or en["total"] == 0 else "BO que baja sin factura nueva que mencione la OC"
+        return {"tipo": tipo, "clase": "revisar", "causa": causa, "doc": texto, "ant": ta, "act": tn, "dif": dif, **cant}
+    if doc_ant is None and (k[0], k[1]) not in ocs_bo_ant:
+        return {"tipo": tipo, "clase": "esperable", "causa": "OC nueva", "doc": texto, "ant": ta, "act": tn, "dif": dif, **cant}
+    return {"tipo": tipo, "clase": "revisar", "causa": "BO que sube en una OC antigua", "doc": texto, "ant": ta, "act": tn, "dif": dif, **cant}
+
+
+def reporte_markdown(cmp: dict) -> str:
+    a, n = cmp["anterior"], cmp["actual"]
+    L = [f'# Cambios {a["fecha"]:%Y-%m-%d} → {n["fecha"]:%Y-%m-%d}', "",
+         f'- Versión anterior: `{a["archivo"]}` · corte facturación {a["corteFact"]:%Y-%m-%d} · corte BO {a["corteBO"]:%Y-%m-%d}',
+         f'- Versión actual: `{n["archivo"]}` · corte facturación {n["corteFact"]:%Y-%m-%d} · corte BO {n["corteBO"]:%Y-%m-%d}',
+         "- Montos en la moneda de reporte de cada marca. ESPERABLE = movimiento normal; REVISAR = requiere explicación.", ""]
+    revisar = [f for f in cmp["filas"] if f["estado"] == "revisar"]
+    L += [f'**{len(cmp["filas"])} meses con cambios** ({len(revisar)} a revisar) · '
+          f'{len(cmp["cumplimientos"])} cumplimientos que cambian · {len(cmp["forecast"])} cambios de forecast · '
+          f'{len(cmp["categorias"])} cambios de categoría · {len(cmp["parametros"])} cambios en {HOJA_MONEDA}', ""]
+    L += ["## Resumen por marca y mes", "", "| Marca | Mes | Δ Facturación | Δ BO | Δ Fact+BO | Estado |", "|---|---|---:|---:|---:|---|"]
+    for f in cmp["filas"]:
+        L.append(f'| {f["marca"]} ({f["moneda"]}) | {f["etiqueta"]} | {fmt_monto(f["fact"]["dif"])} | {fmt_monto(f["bo"]["dif"])} | '
+                 f'{fmt_monto(f["factbo"]["dif"])} | {"⚠ REVISAR" if f["estado"] == "revisar" else "✔ esperable"} |')
+    L += ["", "## Detalle por marca y mes", ""]
+    for f in cmp["filas"]:
+        L.append(f'### {f["marca"]} · {f["etiqueta"]} — {"⚠ REVISAR" if f["estado"] == "revisar" else "✔ esperable"}')
+        L.append("")
+        for tipo, nombre in (("fact", "Facturación"), ("bo", "Backorder")):
+            v = f[tipo]
+            if abs(v["dif"]) < 1e-9:
+                continue
+            items = [i for i in f["items"] if i["tipo"] == tipo]
+            suma = sum(i["dif"] for i in items)
+            L.append(f'**{nombre}:** {fmt_monto(v["ant"])} → {fmt_monto(v["act"])} {f["moneda"]} (Δ {fmt_monto(v["dif"])}) · '
+                     f'suma del detalle {fmt_monto(suma)} {"✔ explica exactamente la diferencia" if v["explicado"] else "✕ NO explica la diferencia"}')
+            L.append("")
+            L.append("| Clase | Causa | Documento | Antes | Ahora | Δ |")
+            L.append("|---|---|---|---:|---:|---:|")
+            for i in sorted(items, key=lambda x: (x["clase"] != "revisar", x["causa"], -abs(x["dif"]))):
+                extra = ""
+                if "cantAnt" in i:
+                    extra = f' · cant. {fmt_monto(i["cantAnt"])} → {fmt_monto(i["cantAct"])}'
+                if "tcAnt" in i:
+                    extra = f' · TC {i["tcAnt"]} → {i["tcAct"]}'
+                L.append(f'| {"⚠ revisar" if i["clase"] == "revisar" else "esperable"} | {i["causa"]} | {i["doc"]}{extra} | '
+                         f'{fmt_monto(i["ant"])} | {fmt_monto(i["act"])} | {fmt_monto(i["dif"])} |')
+            L.append("")
+    L += ["## Cumplimientos que cambian", ""]
+    if cmp["cumplimientos"]:
+        L += ["| Marca | Bloque | Período | Antes | Ahora |", "|---|---|---|---:|---:|"]
+        for c in cmp["cumplimientos"]:
+            pa = "—" if c["ant"] is None else fmt_cl(c["ant"] * 100, 1) + "%"
+            pn = "—" if c["act"] is None else fmt_cl(c["act"] * 100, 1) + "%"
+            L.append(f'| {c["marca"]} | {c["bloque"]} | {c["nombre"]} | {pa} | {pn} |')
+    else:
+        L.append("Sin cambios.")
+    L += ["", "## Cambios de forecast (⚠ revisar)", ""]
+    L += [f'- {c["marca"]} · {c["bloque"]} · {c["periodo"]}: {fmt_monto(c["ant"])} → {fmt_monto(c["act"])}' for c in cmp["forecast"]] or ["Sin cambios."]
+    L += ["", f"## Cambios en {HOJA_MONEDA} (⚠ revisar)", "",
+          "Un cambio de tipo de cambio o la incorporación de una marca cambia montos sin que cambien los documentos.", ""]
+    L += [f"- {p}" for p in cmp["parametros"]] or ["Sin cambios."]
+    L += ["", "## Cambios de categoría (⚠ revisar)", ""]
+    L += [f'- {c["marca"]} · {"Facturación" if c["tipo"] == "fact" else "BO"} · {c["doc"]}: {c["ant"]} → {c["act"]}' for c in cmp["categorias"]] or ["Sin cambios."]
+    return "\n".join(L) + "\n"
+
+
+def resumen_cambios_json(cmp: dict) -> dict:
+    """Resumen para el panel: por marca y mes, sin OC, productos ni precios."""
+    def fecha(d):
+        return d.strftime("%Y-%m-%d") if d else None
+
+    filas = []
+    for f in cmp["filas"]:
+        causas: dict = {}
+        for i in f["items"]:
+            k = (i["clase"], i["causa"], i["tipo"])
+            e = causas.setdefault(k, {"clase": i["clase"], "causa": i["causa"], "tipo": i["tipo"], "n": 0, "monto": 0.0})
+            e["n"] += 1
+            e["monto"] += i["dif"]
+        filas.append({"marca": f["marca"], "moneda": f["moneda"], "anio": f["anio"], "mes": f["mes"], "etiqueta": f["etiqueta"],
+                      "fact": f["fact"], "bo": f["bo"], "factbo": f["factbo"], "estado": f["estado"],
+                      "explicado": f["fact"]["explicado"] and f["bo"]["explicado"],
+                      "causas": sorted(causas.values(), key=lambda c: (c["clase"] != "revisar", -abs(c["monto"])))})
+    return {
+        "anterior": {k: (fecha(v) if isinstance(v, (date, datetime)) else v) for k, v in cmp["anterior"].items()},
+        "actual": {k: (fecha(v) if isinstance(v, (date, datetime)) else v) for k, v in cmp["actual"].items()},
+        "filas": filas, "cumplimientos": cmp["cumplimientos"], "forecast": cmp["forecast"],
+        "parametros": cmp["parametros"], "nCategorias": len(cmp["categorias"]),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# SERIALIZACIÓN
+# ──────────────────────────────────────────────────────────────────────
+
+def _fila_detalle_fact(r):
+    return {"fecha": r["fecha"].strftime("%Y-%m-%d"), "anio": r["anio"], "mes": r["mes"], "folio": r["folio"],
+            "comentarios": r["comentarios"], "oc": r["oc"], "cat": r["cat"], "catRaw": r["cat_raw"],
+            "monedaOrig": r["moneda_orig"], "montoOrig": r["monto_orig"], "tc": r["tc"], "total": r["total"],
+            "convertido": r["convertido"]}
+
+
+def _fila_detalle_bo(r):
+    return {"fecha": r["fecha"].strftime("%Y-%m-%d"), "anio": r["anio"], "mes": r["mes"], "referencia": r["referencia"],
+            "producto": r["producto"], "descripcion": r["descripcion"], "cat": r["cat"], "cantidad": r["cantidad"],
+            "monedaOrig": r["moneda_orig"], "precio": r["precio"], "montoOrig": r["monto_orig"], "tc": r["tc"],
+            "total": r["total"], "convertido": r["convertido"]}
+
+
+def _serializar_marca(m: dict, incluir_detalle: bool) -> dict:
+    salida = {k: m[k] for k in ("hoja", "nombre", "clave", "moneda", "tieneFiscal", "convierte", "paresConversion", "sinFilas")}
     salida["bloques"] = []
     for b in m["bloques"]:
         sb = {"tipo": b["tipo"], "titulo": b["titulo"], "c0": b["c0"], "errores": b["errores"],
@@ -663,7 +1191,52 @@ def _serializar_marca(m: dict) -> dict:
                 **{k: c[k] for k in ("trims", "total", "ytd", "catF", "catB", "rawF", "rawB", "fcSumaMeses", "tieneForecast", "hayDerivado")},
             }
         salida["bloques"].append(sb)
+    if incluir_detalle:
+        periodos = {(x["anio"], x["mes"]) for b in m["bloques"] for x in b["meses"]}
+        salida["detalle"] = {
+            "facturas": [_fila_detalle_fact(r) for r in m["registros"] if r["tipo"] == "fact" and (r["anio"], r["mes"]) in periodos],
+            "bo": [_fila_detalle_bo(r) for r in m["registros"] if r["tipo"] == "bo" and r["cantidad"] > 0],
+        }
     return salida
+
+
+def serializar(res: dict, incluir_detalle: bool = INCLUIR_DETALLE, cambios: dict | None = None, avisos_seleccion=None) -> dict:
+    def fecha_txt(d):
+        return d.strftime("%Y-%m-%d") if d else None
+
+    problemas = [{"nivel": "aviso", "titulo": a} for a in (avisos_seleccion or [])] + [
+        {k: v for k, v in p.items() if k != "filas"} for p in res["problemas"]]
+    if not incluir_detalle:
+        # Sin detalle: no publicar OC, productos ni montos por documento en los textos de validación.
+        for p in problemas:
+            if p.get("detalle") and p["nivel"] in ("aviso", "error") and "fila" in p["detalle"]:
+                p["detalle"] = "(detalle omitido: INCLUIR_DETALLE = False; ver la salida de generar_datos.py)"
+    return {
+        "meta": {
+            "archivo": res["ruta"].name,
+            "fechaArchivo": fecha_txt(res["fecha_archivo"]),
+            "generado": datetime.now().isoformat(timespec="seconds"),
+            "incluirDetalle": incluir_detalle,
+            "hojas": {"facturacion": HOJA_FACTURACION, "bo": HOJA_BO, "moneda": HOJA_MONEDA},
+            "fact": {"hoja": res["t_f"]["nombre"], "filas": len(res["t_f"]["filas"]), "corte": fecha_txt(res["corte_f"])},
+            "bo": {"hoja": res["t_b"]["nombre"], "filas": len(res["t_b"]["filas"]), "corte": fecha_txt(res["corte_b"])},
+            "corte": fecha_txt(res["corte"]),
+            "tolerancia": {"monto": TOLERANCIA_MONTO, "pct": TOLERANCIA_PCT},
+            "categorias": CATEGORIAS, "sinCategoria": SIN_CATEGORIA,
+        },
+        "resumen": res["resumen"],
+        "problemas": problemas,
+        "ocultas": res["ocultas"],
+        "parametros": {"pares": {v["par"]: {"tc": v["tc"], "celda": v["celda"]} for v in res["params"]["pares"].values()},
+                       "marcas": [{"marca": p["marca"], "moneda": p["moneda"]} for p in res["params"]["lista_marcas"]]},
+        "marcas": [_serializar_marca(m, incluir_detalle) for m in res["marcas"]],
+        "cambios": cambios,
+    }
+
+
+def procesar_libro(ruta: Path | str, incluir_detalle: bool = INCLUIR_DETALLE, permitir_sin_categoria: bool = False) -> dict:
+    """Atajo: calcula y serializa un libro (sin comparación)."""
+    return serializar(calcular(ruta, permitir_sin_categoria), incluir_detalle)
 
 
 def _redondear(v):
@@ -676,17 +1249,9 @@ def _redondear(v):
     return v
 
 
-def buscar_excel(carpeta: Path = CARPETA_EXCEL) -> Path:
-    candidatos = [p for p in carpeta.glob("*.xlsx") if not p.name.startswith("~$")]
-    if not candidatos:
-        raise ErrorCarga(f"No hay ningún .xlsx en {carpeta}/. Copia ahí el Excel consolidado.")
-    return max(candidatos, key=lambda p: p.stat().st_mtime)
-
-
-def fmt_cl(v: float, decimales: int = 2) -> str:
-    """Formato es-CL: miles con punto, decimales con coma."""
-    return f"{v:,.{decimales}f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
+# ──────────────────────────────────────────────────────────────────────
+# SALIDA POR CONSOLA
+# ──────────────────────────────────────────────────────────────────────
 
 def imprimir_conciliacion(datos: dict) -> None:
     for m in datos["marcas"]:
@@ -702,28 +1267,67 @@ def imprimir_conciliacion(datos: dict) -> None:
 
 
 def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(description="Genera docs/datos_cumplimiento.json desde el Excel de data/raw/.")
+    ap.add_argument("--permitir-sin-categoria", action="store_true",
+                    help="continuar aunque haya documentos de marcas visibles sin categoría estándar (queda como advertencia en el panel)")
+    args = ap.parse_args(argv[1:])
+
     try:
-        ruta = Path(argv[1]) if len(argv) > 1 else buscar_excel()
-        print(f"Leyendo {ruta} …")
-        datos = procesar_libro(ruta, INCLUIR_DETALLE)
+        sel = seleccionar_actual()
+        print(f'Archivo: {sel["ruta"]} (datos al {sel["fecha"]:%Y-%m-%d})')
+        for a in sel["avisos"]:
+            print(f"  [aviso] {a}")
+        res = calcular(sel["ruta"], args.permitir_sin_categoria)
     except ErrorCarga as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
-    meta, r = datos["meta"], datos["resumen"]
-    print(f'Facturación: hoja "{meta["fact"]["hoja"]}" · {meta["fact"]["filas"]} filas · corte {meta["fact"]["corte"]}')
-    print(f'Backorder:   hoja "{meta["bo"]["hoja"]}" · {meta["bo"]["filas"]} filas · corte {meta["bo"]["corte"]}')
+    r = res["resumen"]
+    print(f'Facturación: hoja "{res["t_f"]["nombre"]}" · {len(res["t_f"]["filas"])} filas · corte {res["corte_f"]:%Y-%m-%d}')
+    print(f'Backorder:   hoja "{res["t_b"]["nombre"]}" · {len(res["t_b"]["filas"])} filas · corte {res["corte_b"]:%Y-%m-%d}')
     print("\nValidaciones:")
-    for p in datos["problemas"]:
-        print(f'  [{p["nivel"]}] {p["titulo"]}' + (f'\n           {p["detalle"]}' if p.get("detalle") else ""))
+    for p in res["problemas"]:
+        print(f'  [{p["nivel"]}] {p["titulo"]}')
+        for linea in p.get("filas") or ([p["detalle"]] if p.get("detalle") else []):
+            print(f"           {linea}")
+    datos = serializar(res, INCLUIR_DETALLE, None, sel["avisos"])
     imprimir_conciliacion(datos)
     print(f'\nConciliación: {r["ok"]}/{r["comparaciones"]} cuadran · {r["diferencias"]} diferencias · '
-          f'{r["errores"]} errores de datos ({r["erroresBloqueantes"]} bloqueantes) · {r["avisos"]} avisos')
+          f'{r["errores"]} errores ({r["erroresBloqueantes"]} bloqueantes) · {r["avisos"]} avisos')
 
     if r["diferencias"] or r["erroresBloqueantes"]:
-        print(f"\nERROR: la conciliación no cuadra. NO se escribió {SALIDA_JSON}.", file=sys.stderr)
+        print(f"\nERROR: hay validaciones que no cuadran. NO se escribió {SALIDA_JSON}.", file=sys.stderr)
         return 1
 
+    # Comparación contra la versión anterior
+    cambios = None
+    try:
+        ant_sel = seleccionar_anterior(sel["fecha"])
+    except ErrorCarga as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    if ant_sel is None:
+        print(f"\n[aviso] No hay una versión anterior en {CARPETA_EXCEL}/{NOMBRE_CARPETA_ANTERIORES}/: se omite el reporte de cambios.")
+    else:
+        print(f'\nComparando contra {ant_sel["ruta"].name} …')
+        try:
+            ant = calcular(ant_sel["ruta"], permitir_sin_categoria=True)
+        except ErrorCarga as e:
+            print(f"[aviso] No se pudo leer la versión anterior ({e}); se omite el reporte de cambios.")
+            ant = None
+        if ant is not None:
+            cmp = comparar_versiones(ant, res)
+            CARPETA_REPORTES.mkdir(parents=True, exist_ok=True)
+            ruta_rep = CARPETA_REPORTES / f'cambios_{ant_sel["fecha"]:%Y%m%d}_a_{sel["fecha"]:%Y%m%d}.md'
+            ruta_rep.write_text(reporte_markdown(cmp), encoding="utf-8")
+            rev = sum(1 for f in cmp["filas"] if f["estado"] == "revisar")
+            no_expl = [f for f in cmp["filas"] if not (f["fact"]["explicado"] and f["bo"]["explicado"])]
+            print(f'Reporte de cambios: {ruta_rep} · {len(cmp["filas"])} meses con cambios ({rev} a revisar)')
+            if no_expl:
+                print(f"[aviso] {len(no_expl)} meses cuya diferencia no se explica exactamente con el detalle.")
+            cambios = resumen_cambios_json(cmp)
+
+    datos = serializar(res, INCLUIR_DETALLE, cambios, sel["avisos"])
     SALIDA_JSON.parent.mkdir(parents=True, exist_ok=True)
     with open(SALIDA_JSON, "w", encoding="utf-8") as f:
         json.dump(_redondear(datos), f, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
