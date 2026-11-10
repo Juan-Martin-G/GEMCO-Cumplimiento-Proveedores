@@ -125,9 +125,31 @@ def test_columna_etiquetas_fiscal(datos):
 
 def test_conciliacion_y_validaciones(datos):
     r = datos["resumen"]
-    assert r["comparaciones"] == 165
+    # 253 celdas por bloque (filas 3–7, 11–15 y 19–23) × 15 bloques (12 calendario + 3 fiscales)
+    assert r["comparaciones"] == 253 * 15
     assert r["diferencias"] == 0
     assert r["erroresBloqueantes"] == 0
+
+
+BLOQUES = [(n, "calendario") for n in [
+    "Steelco", "Melag", "DDC Dolphin", "Yipak", "Franklab", "Pentax", "Creo Medical",
+    "G-Flex", "Bien Air", "Durr Dental", "Eurosets", "Normmed"]] + [("Pentax", "fiscal"), ("G-Flex", "fiscal"), ("Durr Dental", "fiscal")]
+
+
+@pytest.mark.parametrize("nombre,tipo", BLOQUES)
+def test_vista_excel_cuadra_celda_a_celda(datos, nombre, tipo):
+    b = next(x for x in marca(datos, nombre)["bloques"] if x["tipo"] == tipo)
+    assert b["celdas"]["n"] == 253
+    assert b["celdas"]["fallas"] == []
+    vx = b["vista"]
+    assert [c["etiqueta"] for c in vx["columnas"]][:5] == (["Ene", "Feb", "Mar", "Q1", "Abr"] if tipo == "calendario" else ["Jul", "Ago", "Sep", "Q1", "Oct"])
+    assert [f["fila"] for f in vx["filas"]] == [3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 19, 20, 21, 22, 23]
+    # Totales de la vista = totales de la ficha
+    fila = {f["clave"]: f for f in vx["filas"]}
+    assert fila["fact"]["valores"][-1] == pytest.approx(b["calc"]["total"]["fact"])
+    assert fila["bo_total"]["valores"][-1] + 0 == pytest.approx(sum(b["calc"]["catB"][c] for c in gd.CATEGORIAS))
+    if not b["calc"]["tieneForecast"]:
+        assert all(v is None for v in fila["cumpl"]["valores"])        # sin forecast: "—", nunca 0 %
 
 
 def test_lee_hoja_exacta_e_ignora_filas_vacias(datos):
@@ -315,6 +337,8 @@ def construir_libro(ruta, facturas, bo, monedas=None, pares=None, borrar=None, h
         hm.cell(row=1, column=i, value=2026)
         hm.cell(row=2, column=i, value=etiqueta)
     hm["E6"], hm["R6"] = 300, 300            # forecast solo trimestral en Q1
+    for r, etiqueta in zip([11, 12, 13, 14, 15, 19, 20, 21, 22, 23], ["EQUIPOS", "REPUESTOS", "ACCESORIOS", "CONSUMIBLES", "Total"] * 2):
+        hm[f"A{r}"] = etiqueta
     oc = wb.create_sheet("Oculta")
     oc["A1"], oc["A2"], oc["A6"] = "Otra", " Item ", "Forecast "
     oc.sheet_state = "hidden"
@@ -330,8 +354,9 @@ FACTURAS_BASE = [
 BO_BASE = [_bo("0001/26", "P1", datetime(2026, 5, 5), 2, 25)]
 
 
-def _bloqueantes(res):
-    return [p for p in res["problemas"] if p.get("bloqueante")]
+def _bloqueantes(res, conciliacion=False):
+    # La hoja de marca sintética no tiene valores cacheados: salvo que se pida, se ignora la conciliación celda a celda.
+    return [p for p in res["problemas"] if p.get("bloqueante") and (conciliacion or "celdas de las hojas de marca" not in p["titulo"])]
 
 
 def test_sintetico_reglas(tmp_path):
@@ -384,6 +409,40 @@ def test_sintetico_moneda_sin_tipo_de_cambio_falla(tmp_path):
     facturas = FACTURAS_BASE + [_fact(4, datetime(2026, 4, 1), 50, moneda="CLP")]   # no hay par CLP>EUR
     res = gd.calcular(construir_libro(tmp_path / "20261109 s.xlsx", facturas, BO_BASE))
     assert any("sin tipo de cambio" in p["titulo"] for p in _bloqueantes(res))
+
+
+def _escribir_hoja_marca(ruta, res, alterar=None):
+    """Escribe en la hoja de marca los valores que Excel habría cacheado (alterar=(celda, valor) cambia uno)."""
+    b = res["marcas"][0]["bloques"][0]
+    vx = b["vista"]
+    wb = openpyxl.load_workbook(ruta)
+    ws = wb["MarcaX"]
+    for f in vx["filas"]:
+        for j, c in enumerate(vx["columnas"]):
+            if f["clave"] == "cumpl" and c["tipo"] == "mes":
+                continue
+            v = f["celda"][j] if f["clave"] == "forecast" and c["tipo"] == "mes" else f["valores"][j]
+            ws[f'{c["col"]}{f["fila"]}'] = 0 if v is None else v
+        if "pct" in f:
+            ws[f'{vx["colParticipacion"]}{f["fila"]}'] = f["pct"]
+    for r, etiqueta in zip([11, 12, 13, 14, 15, 19, 20, 21, 22, 23], ["EQUIPOS", "REPUESTOS", "ACCESORIOS", "CONSUMIBLES", "Total"] * 2):
+        ws[f"A{r}"] = etiqueta
+    if alterar:
+        ws[alterar[0]] = alterar[1]
+    wb.save(ruta)
+
+
+def test_sintetico_celda_de_hoja_de_marca_que_no_cuadra_falla(tmp_path):
+    ruta = construir_libro(tmp_path / "20261109 s.xlsx", FACTURAS_BASE, BO_BASE)
+    _escribir_hoja_marca(ruta, gd.calcular(ruta))
+    res = gd.calcular(ruta)
+    assert res["resumen"]["diferencias"] == 0 and res["resumen"]["comparaciones"] == 253
+    # Se altera una celda de facturación por categoría (Repuestos · Mar = D20)
+    _escribir_hoja_marca(ruta, res, alterar=("D20", 999))
+    res = gd.calcular(ruta)
+    assert res["resumen"]["diferencias"] == 1
+    error = next(p for p in _bloqueantes(res, conciliacion=True) if "no cuadran" in p["titulo"])
+    assert "MarcaX!D20 (Repuestos · Mar)" in error["detalle"]
 
 
 def test_sintetico_hoja_con_espacio_falla(tmp_path):

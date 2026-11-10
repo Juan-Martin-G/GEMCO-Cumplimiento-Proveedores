@@ -550,6 +550,7 @@ const UI = (() => {
           <p class="sub">${esc(b.titulo)} · hoja <code>"${esc(marca.hoja)}"</code>${b.tipo === 'fiscal' ? ` · columnas ${Util.colLetra(b.c0)}–${Util.colLetra(b.c0 + 17)}` : ''}${c.tieneForecast ? '' : ' · <strong>sin forecast</strong>: solo Facturación y BO'}</p>
         </div>
       </div>
+      ${renderVistaExcel(marca, b, c)}
       <div class="kpis">
         ${kpi('Facturación', monto(c.total.fact), origen(marca, b, 'fact'))}
         ${kpi('Backorder abierto', monto(c.total.bo), origen(marca, b, 'bo'))}
@@ -594,6 +595,118 @@ const UI = (() => {
       renderTablaFact(marca, c);
     }
     chartsFicha(marca, b, c);
+    const btnCopiar = $('#vx-copiar', v);
+    if (btnCopiar) {
+      btnCopiar.addEventListener('click', async () => {
+        const ok = await copiarTexto(vistaExcelTSV(marca, b));
+        btnCopiar.textContent = ok ? '✔ Copiada' : 'No se pudo copiar';
+        setTimeout(() => { btnCopiar.textContent = 'Copiar tabla'; }, 1800);
+      });
+    }
+  }
+
+  /* ---------- Vista Excel: réplica de la hoja de marca ---------- */
+  function renderVistaExcel(marca, b, c) {
+    const vx = b.vista;
+    if (!vx) return '';
+    const hoja = Util.refHoja(marca.hoja);
+    const corteIdx = modelo.corte ? modelo.corte.getFullYear() * 12 + modelo.corte.getMonth() : Infinity;
+    const cols = vx.columnas;
+    const futura = col => (col.tipo === 'mes' ? col.anio * 12 + col.mes > corteIdx
+      : col.tipo === 'trim' ? c.trims[col.q].estado === 'futuro' : false);
+    const clase = col => [col.tipo === 'trim' ? 'q' : '', col.tipo === 'total' ? 'tot' : '', futura(col) ? 'fut' : ''].filter(Boolean).join(' ');
+    const mesesDeQ = q => cols.filter(x => x.tipo === 'mes' && Math.floor(x.i / 3) === q).map(x => x.etiqueta).join(' + ');
+    const periodo = col => `Año=${col.anio}, Mes=${Util.MESES[col.mes]}`;
+    const periodoBO = col => `Año OC=${col.anio}, Mes=${Util.MESES[col.mes]}`;
+    const fact = `Σ ${modelo.hojas.facturacion} 'Total moneda marca' | Proveedor=${marca.nombre}`;
+    const bo = `Σ ${modelo.hojas.bo} 'Total moneda marca' | Marca=${marca.nombre}`;
+    const sinFc = !c.tieneForecast;
+
+    function tip(f, col, j) {
+      const ref = `${hoja}!${col.col}${f.fila}`;
+      let d;
+      if (col.tipo === 'trim' && f.clave !== 'cumpl') d = `= ${mesesDeQ(col.q)}`;
+      else if (col.tipo === 'total' && f.clave !== 'cumpl') d = '= Q1 + Q2 + Q3 + Q4';
+      else if (f.clave === 'fact') d = `${fact}, ${periodo(col)}`;
+      else if (f.clave === 'bo') d = `${bo}, ${periodoBO(col)}`;
+      else if (f.clave === 'factbo') d = '= Facturación + Backorder (fila 3 + fila 4)';
+      else if (f.clave === 'forecast') d = f.derivado[j] ? `derivado: ${cols.find(x => x.tipo === 'trim' && x.q === Math.floor(col.i / 3)).etiqueta} / 3 (la celda del Excel está vacía)` : 'Input manual del Excel (fila 6)';
+      else if (f.clave === 'cumpl') d = '= Fact+BO / Forecast (IFERROR(…;0) en el Excel; sin forecast = —)';
+      else if (f.clave.endsWith('_total')) d = '= suma de las 4 categorías';
+      else if (f.seccion === 'bo') d = `${bo}, Grupo=${f.etiqueta}, ${periodoBO(col)}`;
+      else d = `${fact}, Categoria=${f.etiqueta}, ${periodo(col)}`;
+      return `${ref} · ${d}`;
+    }
+    function celda(f, col, j) {
+      const v = f.valores[j];
+      const cls = clase(col);
+      if (f.clave === 'cumpl') {
+        if (col.tipo === 'mes') return `<td class="${cls}"></td>`;
+        return `<td class="${cls}">${chip(sinFc && col.tipo === 'total' ? null : v, tip(f, col, j))}</td>`;
+      }
+      const der = f.derivado && f.derivado[j];
+      const txt = v == null ? '<span class="muted">—</span>' : der ? `<em class="der">${fmt(v)}</em>` : fmt(v);
+      return `<td class="${cls}" data-tip="${esc(tip(f, col, j) + (der ? ' · derivado' : ''))}">${txt}</td>`;
+    }
+    const cabecera = (titulo, conPct) => `<tr class="vx-h"><th class="lbl" scope="col">${esc(titulo)}</th>${cols.map(col => {
+      const parcial = col.tipo === 'trim' && c.trims[col.q].estado === 'parcial';
+      return `<th scope="col" class="${clase(col)}">${esc(col.etiqueta)}${parcial ? '<br><span class="tag tag-parcial">parcial</span>' : ''}</th>`;
+    }).join('')}<th scope="col" class="pct">${conPct ? '<abbr title="% participación (columna S del Excel)">% part.</abbr>' : ''}</th></tr>`;
+    const filaHtml = f => `<tr class="vx-${f.clave}${f.clave.endsWith('_total') ? ' vx-total' : ''}"><th scope="row" class="lbl">${esc(f.etiqueta)}</th>${cols.map((col, j) => celda(f, col, j)).join('')}${'pct' in f
+      ? `<td class="pct" data-tip="${esc(`${hoja}!${vx.colParticipacion}${f.fila} · = Total de la fila / Total ${f.seccion === 'bo' ? 'Backorder (fila 4)' : 'Facturación (fila 3)'}`)}">${(f.seccion === 'bo' ? c.total.bo : c.total.fact) ? fmtPct(f.pct) : '<span class="muted">—</span>'}</td>`
+      : '<td class="pct"></td>'}</tr>`;
+    const seccion = s => vx.filas.filter(f => f.seccion === s).map(filaHtml).join('');
+    const celdas = b.celdas || { n: 0, ok: 0 };
+    return `<section class="panel vista-excel">
+      <div class="panel-h panel-h-fila"><div>
+        <h2>Vista Excel: hoja ${esc(marca.hoja.trim())} <span class="moneda-chip">${esc(marca.moneda)}</span></h2>
+        <p class="nota">${esc(b.titulo)} · columnas ${Util.colLetra(b.c0 + 1)}–${vx.colParticipacion}. Mismos valores que la hoja del Excel, recalculados por generar_datos.py:
+          ${celdas.ok === celdas.n ? `<span class="ok-txt">✔ ${nf0.format(celdas.n)} celdas cuadran</span>` : `<span class="error-txt">✕ ${nf0.format(celdas.n - celdas.ok)} celdas no cuadran</span>`}.
+          Pasa el cursor sobre una celda para ver su origen.</p></div>
+        <button type="button" class="btn-sec" id="vx-copiar">Copiar tabla</button>
+      </div>
+      <div class="vx-wrap"><table class="tabla-vx">
+        <thead>${cabecera('Item', false)}</thead>
+        <tbody>${seccion('principal')}</tbody>
+        <tbody>${cabecera('Backorder por categoría', true)}${seccion('bo')}</tbody>
+        <tbody>${cabecera('Facturación por categoría', true)}${seccion('fact')}</tbody>
+      </table></div>
+      <p class="nota vx-leyenda"><span class="vx-muestra q"></span> trimestre · <strong>Total</strong> · <em>cursiva</em> = forecast derivado (trimestre / 3) · <span class="fut">gris</span> = posterior al corte (${fmtFecha(modelo.corte)})</p>
+    </section>`;
+  }
+
+  // Texto separado por tabulaciones (decimales con coma) para pegar en Excel.
+  function vistaExcelTSV(marca, b) {
+    const vx = b.vista;
+    const num = v => (v == null ? '' : String(Math.round(v * 1e6) / 1e6).replace('.', ','));
+    const pct = v => (v == null ? '' : `${String(Math.round(v * 1e6) / 1e4).replace('.', ',')}%`);
+    const lineas = [`Vista Excel: hoja ${marca.hoja.trim()} (${marca.moneda}) · ${b.titulo}`];
+    const cab = t => [t, ...vx.columnas.map(c => c.etiqueta), t === 'Item' ? '' : '% participación'].join('\t');
+    for (const [s, titulo] of [['principal', 'Item'], ['bo', 'Backorder por categoría'], ['fact', 'Facturación por categoría']]) {
+      lineas.push(cab(titulo));
+      for (const f of vx.filas.filter(x => x.seccion === s)) {
+        const vals = f.valores.map((v, j) => (f.clave === 'cumpl' ? (vx.columnas[j].tipo === 'mes' ? '' : pct(v)) : num(v)));
+        lineas.push([f.etiqueta, ...vals, 'pct' in f ? pct(f.pct) : ''].join('\t'));
+      }
+    }
+    return lineas.join('\r\n');
+  }
+
+  async function copiarTexto(texto) {
+    try {
+      await navigator.clipboard.writeText(texto);
+      return true;
+    } catch (e) {
+      const ta = document.createElement('textarea');
+      ta.value = texto;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    }
   }
 
   function bindFicha(v) {
@@ -836,15 +949,19 @@ const UI = (() => {
     };
     const bloquesHtml = modelo.marcas.map(m => {
       const items = m.bloques.flatMap(b => b.conc);
-      const dif = items.filter(i => !i.ok).length;
+      const nCeldas = m.bloques.reduce((s, b) => s + (b.celdas ? b.celdas.n : 0), 0);
+      const dif = items.filter(i => !i.ok).length + m.bloques.reduce((s, b) => s + (b.celdas ? b.celdas.n - b.celdas.ok : 0), 0);
       const erroresMarca = modelo.problemas.filter(p => p.marca === m.nombre && p.nivel !== 'ok');
       if (estado.soloDif && !dif && !erroresMarca.length && m.bloques.every(b => b.calc)) return '';
       return `<section class="panel conc-marca">
         <div class="panel-h panel-h-fila"><h2>${esc(m.nombre)} <span class="muted">· hoja "${esc(m.hoja)}" · ${esc(m.moneda)}</span></h2>
-          <span class="chip ${dif ? 'chip-rojo' : 'chip-verde'}">${dif ? `✕ ${dif} con diferencia` : `✔ ${items.length}/${items.length}`}</span></div>
+          <span class="chip ${dif ? 'chip-rojo' : 'chip-verde'}">${dif ? `✕ ${dif} con diferencia` : `✔ ${nf0.format(nCeldas)}/${nf0.format(nCeldas)} celdas`}</span></div>
         ${erroresMarca.map(p => `<p class="problema problema-${p.nivel}"><span aria-hidden="true">${icono[p.nivel]}</span> ${esc(p.titulo)}${p.detalle ? `<br><span class="muted">${esc(p.detalle)}</span>` : ''}</p>`).join('')}
         ${m.bloques.map(b => !b.calc ? `<p class="error-txt">Bloque ${esc(b.tipo)}: ${esc(b.errores.join(' '))}</p>` : `
           <h3>${esc(b.titulo)}</h3>
+          <p class="nota conc-celdas">${b.celdas ? (b.celdas.ok === b.celdas.n
+            ? `<span class="ok-txt">✔ ${nf0.format(b.celdas.n)}/${nf0.format(b.celdas.n)} celdas</span> de la hoja cuadran (filas 3–7, 11–15 y 19–23, columnas ${Util.colLetra(b.c0 + 1)}–${Util.colLetra(b.c0 + 18)}). Resumen:`
+            : `<span class="error-txt">✕ ${nf0.format(b.celdas.n - b.celdas.ok)} de ${nf0.format(b.celdas.n)} celdas no cuadran:</span> ${b.celdas.fallas.map(x => esc(x.celda)).join(', ')}`) : ''}</p>
           <div class="tabla-wrap"><table class="tabla tabla-conc">
             <thead><tr><th>Concepto</th><th>Celda</th><th class="n">Excel (cache)</th><th class="n">Recalculado app</th><th class="n">Resultado</th></tr></thead>
             <tbody>${b.conc.filter(it => !estado.soloDif || !it.ok).map(it => `<tr class="${it.ok ? '' : 'fila-dif'}">
@@ -863,7 +980,7 @@ const UI = (() => {
         <p class="sub">Resultado de generar_datos.py: lo recalculado desde las BBDD contra los valores cacheados de cada hoja de marca visible. Si algo no cuadra, el script no publica el JSON. Tolerancia: ${fmt(modelo.tolerancia.monto)} en montos y ${nfTC.format(modelo.tolerancia.pct)} en % (${nf.format(modelo.tolerancia.pct * 100)} pp).</p>
       </div></div>
       <div class="stats">
-        <div class="stat"><span class="stat-v">${nf0.format(r.comparaciones)}</span><span class="stat-k">comparaciones</span></div>
+        <div class="stat"><span class="stat-v">${nf0.format(r.comparaciones)}</span><span class="stat-k">celdas comparadas</span></div>
         <div class="stat"><span class="stat-v ok-txt">✔ ${nf0.format(r.ok)}</span><span class="stat-k">cuadran</span></div>
         <div class="stat"><span class="stat-v ${r.diferencias ? 'error-txt' : ''}">${r.diferencias ? '✕ ' : ''}${nf0.format(r.diferencias)}</span><span class="stat-k">con diferencia</span></div>
         <div class="stat"><span class="stat-v ${r.errores ? 'error-txt' : ''}">${nf0.format(r.errores)}</span><span class="stat-k">errores de datos</span></div>

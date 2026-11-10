@@ -115,13 +115,27 @@ Para cada fila con datos de `BBDD Facturacion` y `BBDD BO abiertas`, el script r
 
 ## Conciliación
 
-`generar_datos.py` compara lo recalculado con los valores cacheados de cada hoja de marca visible y de cada bloque (calendario y fiscal). Compara:
+`generar_datos.py` compara lo recalculado con los valores cacheados de **cada celda** de cada hoja de marca visible y de cada bloque (calendario y fiscal):
 
-- los totales de las filas 3 a 7;
-- el cumplimiento de cada trimestre;
-- los totales de las filas 15 y 23.
+- **Filas comparadas:** 3 a 7 (Facturación, Backorder, Fact+BO, Forecast y Cumplimiento, este último solo en Q1–Q4 y Total), 11 a 15 (BO por categoría) y 19 a 23 (facturación por categoría).
+- **Columnas:** meses, trimestres, total y % de participación. En el bloque calendario son B–S; en el fiscal, las equivalentes.
+- **Celdas comparadas:** 253 por bloque. Con 12 marcas y 3 bloques fiscales suman 3.795.
+- **Forecast mensual:** se compara contra la celda del Excel. Un mes derivado (trimestre/3) es una celda vacía en el Excel.
 
-La tolerancia es 0,01 en montos y 0,0001 en %. La pestaña **Conciliación** del panel muestra la tabla completa. Cualquier diferencia, una estructura de hoja inesperada o fechas inválidas bloquean la publicación.
+La tolerancia es 0,01 en montos y 0,0001 en %. Si una celda no cuadra, el script falla e indica la hoja y la celda exactas. La pestaña **Conciliación** del panel muestra el conteo por bloque y la tabla resumen. Una estructura de hoja inesperada o fechas inválidas también bloquean la publicación.
+
+### Vista Excel en la ficha
+
+La ficha de cada marca empieza con la tabla **"Vista Excel: hoja <nombre>"**, que replica la hoja de marca: bloque principal, BO por categoría y facturación por categoría, con meses, trimestres, total y % de participación. Usa los mismos valores ya conciliados y responde al selector *Año calendario / Año fiscal USA*.
+
+- **Tooltips:** cada celda tiene un tooltip con su origen, por ejemplo `Steelco!F4 · Σ BBDD BO abiertas 'Total moneda marca' | Marca=Steelco, Año OC=2026, Mes=abril`.
+- **Formato:**
+  - trimestres sombreados y Total en negrita;
+  - Cumplimiento con el semáforo; sin forecast muestra "—";
+  - forecast derivado en cursiva;
+  - meses posteriores al corte en gris y Q4 marcado como *parcial*.
+- **En el celular:** la tabla se desplaza dentro de su recuadro con la columna de etiquetas fija.
+- **Copiar tabla:** el botón copia el bloque visible como texto separado por tabulaciones, para pegarlo en Excel.
 
 ## Cambios vs versión anterior
 

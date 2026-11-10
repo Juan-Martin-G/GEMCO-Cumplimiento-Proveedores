@@ -587,6 +587,7 @@ def leer_bloque(ws, hoja: str, c0: int, tipo: str) -> dict:
         return n if es_num(n) else None
 
     fc_mes = [fc_celda(off) for off in LAYOUT_MESES]
+    fc_mes_celda = list(fc_mes)          # valor de la celda, antes de derivar trimestre/3
     fc_trim = [fc_celda(off) for off in LAYOUT_TRIMESTRES]
     fc_total = fc_celda(LAYOUT_TOTAL)
     fc_derivado = [False] * 12
@@ -605,7 +606,8 @@ def leer_bloque(ws, hoja: str, c0: int, tipo: str) -> dict:
         titulo = (f"Año fiscal USA ({mes_corto(ini['anio'], ini['mes'])} – {mes_corto(fin['anio'], fin['mes'])})"
                   if ok else "Año fiscal USA")
     return {"tipo": tipo, "hoja": hoja, "c0": c0, "titulo": titulo, "meses": meses, "errores": errores,
-            "fc_mes": fc_mes, "fc_trim": fc_trim, "fc_total": fc_total, "fc_derivado": fc_derivado, "ws": ws}
+            "fc_mes": fc_mes, "fc_mes_celda": fc_mes_celda, "fc_trim": fc_trim, "fc_total": fc_total,
+            "fc_derivado": fc_derivado, "ws": ws}
 
 
 def calcular_bloque(b: dict, marca_clave: str, idx_f: dict, idx_b: dict, corte_idx: int) -> dict:
@@ -705,6 +707,109 @@ def conciliar_bloque(b: dict, calc: dict) -> list[dict]:
         f'Excluye "{SIN_CATEGORIA}" ({sin_b}), igual que la hoja' if sin_b else "")
     add("Total facturación por categoría (fila 23)", FILA["fact_total"], T, sum4(calc["catF"]), "monto",
         f'Excluye "{SIN_CATEGORIA}" ({sin_f}), igual que la hoja' if sin_f else "")
+    return items
+
+
+# ──────────────────────────────────────────────────────────────────────
+# VISTA EXCEL (réplica de la hoja de marca) Y CONCILIACIÓN CELDA A CELDA
+# ──────────────────────────────────────────────────────────────────────
+
+FILAS_CATEGORIA = {"bo": [11, 12, 13, 14], "bo_total": 15, "fact": [19, 20, 21, 22], "fact_total": 23}
+COL_PARTICIPACION = 18          # columna S (relativa a la columna de etiquetas)
+
+
+def _columnas_vista(b: dict) -> list[dict]:
+    cols = []
+    for off in range(1, LAYOUT_TOTAL + 1):
+        if off == LAYOUT_TOTAL:
+            cols.append({"off": off, "tipo": "total", "etiqueta": "Total"})
+        elif off in LAYOUT_TRIMESTRES:
+            cols.append({"off": off, "tipo": "trim", "q": LAYOUT_TRIMESTRES.index(off), "etiqueta": f"Q{LAYOUT_TRIMESTRES.index(off) + 1}"})
+        else:
+            i = LAYOUT_MESES.index(off)
+            m = b["meses"][i]
+            cols.append({"off": off, "tipo": "mes", "i": i, "anio": m["anio"], "mes": m["mes"], "etiqueta": MESES_CORTOS[m["mes"]]})
+    return cols
+
+
+def _expandir(mensual: list, cols: list[dict]) -> list:
+    """12 valores mensuales → 17 columnas (meses, Q1–Q4 = suma de sus meses, Total = suma de trimestres)."""
+    trims = [sum((mensual[3 * q + k] or 0.0) for k in range(3)) for q in range(4)]
+    salida = []
+    for c in cols:
+        salida.append(mensual[c["i"]] if c["tipo"] == "mes" else trims[c["q"]] if c["tipo"] == "trim" else sum(trims))
+    return salida
+
+
+def vista_excel(b: dict, calc: dict) -> tuple[dict, list[str]]:
+    """Valores de las filas 3–7, 11–15 y 19–23 (columnas B–R y S) tal como los muestra la hoja de marca."""
+    cols = _columnas_vista(b)
+    meses = calc["meses"]
+    filas = []
+
+    def fila(clave, etiqueta, seccion, nfila, tipo, valores, **extra):
+        filas.append({"clave": clave, "etiqueta": etiqueta, "seccion": seccion, "fila": nfila, "tipo": tipo, "valores": valores, **extra})
+
+    fila("fact", "Facturación", "principal", FILA["fact"], "monto", _expandir([m["fact"] for m in meses], cols))
+    fila("bo", "Backorder", "principal", FILA["bo"], "monto", _expandir([m["bo"] for m in meses], cols))
+    fila("factbo", "Fact + BO", "principal", FILA["factbo"], "monto", _expandir([m["factbo"] for m in meses], cols))
+    fila("forecast", "Forecast", "principal", FILA["forecast"], "monto", _expandir(list(b["fc_mes"]), cols),
+         derivado=[b["fc_derivado"][c["i"]] if c["tipo"] == "mes" else False for c in cols],
+         celda=[b["fc_mes_celda"][c["i"]] if c["tipo"] == "mes" else None for c in cols])
+    cumpl = [calc["trims"][c["q"]]["cumpl"] if c["tipo"] == "trim" else calc["total"]["cumpl"] if c["tipo"] == "total" else None for c in cols]
+    fila("cumpl", "Cumplimiento", "principal", FILA["cumpl"], "pct", cumpl)
+
+    errores = []
+    for seccion, base_total, clave_cat, filas_cat, fila_total in (
+            ("bo", calc["total"]["bo"], "_catB", FILAS_CATEGORIA["bo"], FILAS_CATEGORIA["bo_total"]),
+            ("fact", calc["total"]["fact"], "_catF", FILAS_CATEGORIA["fact"], FILAS_CATEGORIA["fact_total"])):
+        suma = [0.0] * len(cols)
+        suma_pct = 0.0
+        for cat, nfila in zip(CATEGORIAS, filas_cat):
+            etiqueta_hoja = clave(valor(b["ws"], nfila, b["c0"]))
+            if etiqueta_hoja != cat.lower():
+                errores.append(f'{b["hoja"]}!{dir_celda(nfila, b["c0"])}: se esperaba "{cat.upper()}" y dice "{etiqueta_hoja}".')
+            vals = _expandir([m[clave_cat][cat] for m in meses], cols)
+            pct = vals[-1] / base_total if base_total else 0.0          # IFERROR(R/R4,0) o IFERROR(R/R3,0)
+            fila(f"{seccion}_{cat.lower()}", cat, seccion, nfila, "monto", vals, pct=pct)
+            suma = [a + v for a, v in zip(suma, vals)]
+            suma_pct += pct
+        if clave(valor(b["ws"], fila_total, b["c0"])) != "total":
+            errores.append(f'{b["hoja"]}!{dir_celda(fila_total, b["c0"])}: se esperaba "Total".')
+        fila(f"{seccion}_total", "Total", seccion, fila_total, "monto", suma, pct=suma_pct)
+
+    vista = {"columnas": [{k: v for k, v in c.items() if k != "off"} | {"col": col_letra(b["c0"] + c["off"])} for c in cols],
+             "colParticipacion": col_letra(b["c0"] + COL_PARTICIPACION), "filas": filas}
+    return vista, errores
+
+
+def conciliar_celdas(b: dict, vista: dict) -> list[dict]:
+    """Compara cada celda de la vista contra el valor cacheado de la misma celda en la hoja de marca."""
+    ws, c0, hoja = b["ws"], b["c0"], b["hoja"]
+    items = []
+
+    def comparar(nfila, off, app, tipo, concepto):
+        ex = numero(valor(ws, nfila, c0 + off))
+        no_num = ex is NO_NUM
+        ex_v = 0.0 if ex is None else (None if no_num else ex)          # vacío ≙ 0 (IFERROR del Excel)
+        ap_v = 0.0 if app is None else app
+        dif = None if ex_v is None else ap_v - ex_v
+        tol = TOLERANCIA_PCT if tipo == "pct" else TOLERANCIA_MONTO
+        items.append({"celda": f"{ref_hoja(hoja)}!{dir_celda(nfila, c0 + off)}", "concepto": concepto,
+                      "excel": None if (ex is None or no_num) else ex, "excelNoNumerico": no_num,
+                      "app": app, "dif": dif, "tipo": tipo, "ok": dif is not None and abs(dif) <= tol + 1e-9})
+
+    cols = _columnas_vista(b)
+    for f in vista["filas"]:
+        for j, c in enumerate(cols):
+            if f["clave"] == "cumpl" and c["tipo"] == "mes":
+                continue                                    # la fila 7 solo tiene trimestres y total
+            app = f["valores"][j]
+            if f["clave"] == "forecast" and c["tipo"] == "mes":
+                app = f["celda"][j]                         # el mes derivado (trimestre/3) es una celda vacía en el Excel
+            comparar(f["fila"], c["off"], app, f["tipo"], f'{f["etiqueta"]} · {c["etiqueta"]}')
+        if "pct" in f:
+            comparar(f["fila"], COL_PARTICIPACION, f["pct"], "pct", f'{f["etiqueta"]} · % participación')
     return items
 
 
@@ -849,11 +954,15 @@ def calcular(ruta: Path | str, permitir_sin_categoria: bool = False) -> dict:
         for b in bloques:
             if b["errores"]:
                 problemas.append({"nivel": "error", "bloqueante": True, "titulo": f'Hoja "{nombre}", bloque {b["tipo"]}: estructura inesperada', "detalle": " ".join(b["errores"])})
-                b["calc"], b["conc"], b["conversion"] = None, [], []
+                b["calc"], b["conc"], b["conversion"], b["vista"], b["celdas"] = None, [], [], None, []
                 continue
             b["calc"] = calcular_bloque(b, mc, idx_f, idx_b, corte_idx)
             b["conc"] = conciliar_bloque(b, b["calc"])
             b["conversion"] = resumen_conversion(b["calc"])
+            b["vista"], errores_vista = vista_excel(b, b["calc"])
+            if errores_vista:
+                problemas.append({"nivel": "error", "bloqueante": True, "titulo": f'Hoja "{nombre}", bloque {b["tipo"]}: etiquetas de categoría inesperadas', "detalle": " ".join(errores_vista)})
+            b["celdas"] = conciliar_celdas(b, b["vista"])
         regs = [r for r in todos if r["marca_clave"] == mc]
         convertidos = [r for r in regs if r["convertido"] and r["tc"] is not None]
         pares_conv = []
@@ -875,11 +984,21 @@ def calcular(ruta: Path | str, permitir_sin_categoria: bool = False) -> dict:
     if ocultas:
         problemas.append({"nivel": "info", "titulo": "Hojas ocultas ignoradas (no se leen): " + ", ".join(f'"{n}"' for n in ocultas)})
 
-    items = [i for m in marcas for b in m["bloques"] for i in b["conc"]]
+    # Conciliación celda a celda: todas las celdas de la vista Excel (incluye las de b["conc"]).
+    items = [i for m in marcas for b in m["bloques"] for i in b["celdas"]]
+    fallas = [i for i in items if not i["ok"]] + [i for m in marcas for b in m["bloques"] for i in b["conc"] if not i["ok"]]
+    if fallas:
+        def _v(x, tipo):
+            return "no numérica" if x is None else (fmt_cl(x * 100, 2) + "%" if tipo == "pct" else fmt_monto(x))
+        lineas = [f'{i["celda"]} ({i["concepto"]}): Excel={_v(i["excel"] if not i.get("excelNoNumerico") else None, i["tipo"])} '
+                  f'recalculado={_v(i["app"] if i["app"] is not None else 0.0, i["tipo"])}' for i in fallas]
+        problemas.append({"nivel": "error", "bloqueante": True,
+                          "titulo": f"{len(fallas)} celdas de las hojas de marca no cuadran con el recálculo",
+                          "detalle": _lista(lineas, 30), "filas": lineas})
     resumen = {
         "comparaciones": len(items),
         "ok": sum(1 for i in items if i["ok"]),
-        "diferencias": sum(1 for i in items if not i["ok"]),
+        "diferencias": len(fallas),
         "errores": sum(1 for p in problemas if p["nivel"] == "error"),
         "erroresBloqueantes": sum(1 for p in problemas if p.get("bloqueante")),
         "avisos": sum(1 for p in problemas if p["nivel"] == "aviso"),
@@ -1221,7 +1340,9 @@ def _serializar_marca(m: dict, incluir_detalle: bool) -> dict:
     for b in m["bloques"]:
         sb = {"tipo": b["tipo"], "titulo": b["titulo"], "c0": b["c0"], "errores": b["errores"],
               "meses": [{"anio": x["anio"], "mes": x["mes"]} for x in b["meses"]],
-              "conc": b["conc"], "conversion": b["conversion"], "calc": None}
+              "conc": b["conc"], "conversion": b["conversion"], "calc": None, "vista": b.get("vista"),
+              "celdas": {"n": len(b.get("celdas") or []), "ok": sum(1 for i in b.get("celdas") or [] if i["ok"]),
+                         "fallas": [i for i in b.get("celdas") or [] if not i["ok"]]}}
         c = b["calc"]
         if c:
             sb["calc"] = {

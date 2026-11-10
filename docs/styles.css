@@ -392,3 +392,34 @@ p.problema { margin: 0 0 8px; display: block; }
 }
 .causa-aviso span:first-child { color: var(--st-amarillo-ink); font-weight: 600; }
 .tag-aviso { background: var(--st-amarillo-bg); color: var(--st-amarillo-ink); border-color: transparent; }
+
+/* ---------- Vista Excel (réplica de la hoja de marca) ---------- */
+.vista-excel { overflow: hidden; padding: 14px 10px; }
+.tabla-vx td:first-of-type { padding-left: 6px; }
+.vx-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border: 1px solid var(--grid); border-radius: 8px; max-width: 100%; }
+.tabla-vx { border-collapse: separate; border-spacing: 0; font-size: 0.71rem; width: 100%; }
+.tabla-vx th, .tabla-vx td { padding: 5px 2px 5px 3px; white-space: nowrap; border-bottom: 1px solid var(--grid); text-align: right; font-variant-numeric: tabular-nums; }
+.tabla-vx .lbl { position: sticky; left: 0; z-index: 2; background: var(--surface); text-align: left; font-weight: 600; min-width: 84px; padding-left: 8px !important; box-shadow: inset -1px 0 0 var(--line); }
+.tabla-vx .vx-h th { background: var(--surface-2); color: var(--ink-2); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.03em; font-weight: 700; }
+.tabla-vx .vx-h th.lbl { background: var(--surface-2); }
+.tabla-vx tbody + tbody .vx-h th { border-top: 10px solid var(--surface); }
+.tabla-vx .q { background: var(--surface-2); }
+.tabla-vx .vx-h th.q { background: var(--grid); }
+.tabla-vx .tot { font-weight: 700; box-shadow: inset 1px 0 0 var(--line); }
+.tabla-vx .pct { color: var(--ink-2); box-shadow: inset 1px 0 0 var(--line); }
+.tabla-vx .fut { color: var(--ink-3); }
+.tabla-vx td.fut { opacity: 0.6; }
+.tabla-vx .vx-total th, .tabla-vx .vx-total td, .tabla-vx .vx-factbo th, .tabla-vx .vx-factbo td { font-weight: 700; border-top: 1px solid var(--line); }
+.tabla-vx em.der { font-style: italic; color: var(--ink-2); }
+.tabla-vx .chip { font-size: 0.72rem; padding: 1px 5px; }
+.tabla-vx tbody tr:hover td, .tabla-vx tbody tr:hover th.lbl { background: var(--accent-soft); }
+.vx-leyenda { margin-top: 8px; }
+.vx-leyenda .fut { color: var(--ink-3); }
+.vx-muestra { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -2px; background: var(--surface-2); border: 1px solid var(--line); }
+.conc-celdas { margin: 0 0 6px; }
+@media (max-width: 720px) {
+  .tabla-vx { font-size: 0.75rem; }
+  .tabla-vx .lbl { min-width: 96px; max-width: 120px; white-space: normal; }
+}
+.tabla-vx .tag-parcial { font-size: 0.6rem; padding: 0 4px; margin-top: 2px; text-transform: none; letter-spacing: 0; }
+.tabla-vx abbr { text-decoration: none; }
